@@ -180,16 +180,19 @@ spurious_interrupt:
     LOAD  x1,   1 * REGBYTES(sp)
 
     LOAD  t0,   2 * REGBYTES(sp)
-#if CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32S31
-    /* Common context_gcc.S stores only MPIE for a cooperative switch.
-     * Such a frame can also be resumed here by the tick ISR. Keep MPP=M
-     * without forcing MPIE: rt_schedule restores its caller's MIE later.
-     * ESP32-S31 is machine-mode only and uses the same cooperative frame
-     * layout, so it needs the same fix-up.
+    /* Force MPP=M for frames produced by a cooperative switch.
+     *
+     * port/common/context_gcc.S stores mstatus with only MPIE updated for
+     * rt_hw_context_switch(), so MPP is 0 in that frame. If such a frame is
+     * resumed through this trap exit (the tick ISR can pick it), mret would
+     * return to user mode and take a fault. The fix is unconditional on
+     * purpose: every target this file is built for (C3, C6, S31) is
+     * machine-mode only, and a capability predicate would be wrong here -
+     * SOC_INT_HW_NESTED_SUPPORTED is set on ESP32-S31, yet S31 needs the fix
+     * exactly like the PLIC targets do.
      */
     li    t1, 0x1800
     or    t0, t0, t1
-#endif
     csrw  mstatus, t0                       /* Restore the saved interrupt state, supplying MPP=M for cooperative frames. */
 
     LOAD  x3,   3 * REGBYTES(sp)            /* restore gp from slot 3 */
