@@ -7,7 +7,7 @@ if(non_os_build)
     return()
 endif()
 if(CMAKE_BUILD_EARLY_EXPANSION)
-    if(target STREQUAL "esp32c3" OR target STREQUAL "esp32c6")
+    if(target STREQUAL "esp32c3" OR target STREQUAL "esp32c6" OR target STREQUAL "esp32s31")
         idf_component_register(PRIV_REQUIRES freertos riscv)
     else()
         idf_component_register()
@@ -18,8 +18,8 @@ if(NOT CONFIG_IDF_RTOS_RTTHREAD)
     idf_component_register()
     return()
 endif()
-if(NOT (target STREQUAL "esp32c3" OR target STREQUAL "esp32c6"))
-    message(FATAL_ERROR "The rtthread component supports only ESP32-C3 and ESP32-C6")
+if(NOT (target STREQUAL "esp32c3" OR target STREQUAL "esp32c6" OR target STREQUAL "esp32s31"))
+    message(FATAL_ERROR "The rtthread component supports only ESP32-C3, ESP32-C6 and ESP32-S31")
 endif()
 
 # Upstream RT-Thread is the only external source tree. Its src/ and include/ are
@@ -77,14 +77,25 @@ set(kernel_srcs
     "${RTTHREAD_ROOT}/src/klibc/rt_vsnprintf_tiny.c"
     "${RTTHREAD_ROOT}/src/klibc/rt_vsscanf.c")
 
+# RT-Thread master split the RISC-V CPU port into libcpu/risc-v/common (the new,
+# FDT/DM aware port) and libcpu/risc-v/legacy_common (the flat layout this
+# component was written against). The port here needs cpuport.h and
+# rt_hw_stack_frame.h at the top of the directory, which is the legacy_common
+# layout, so resolve the directory once and use it for both the existence check
+# and the include path.
+set(rtt_riscv_port_dir "${RTTHREAD_ROOT}/libcpu/risc-v/legacy_common")
+if(NOT EXISTS "${rtt_riscv_port_dir}/cpuport.h")
+    set(rtt_riscv_port_dir "${RTTHREAD_ROOT}/libcpu/risc-v/common")
+endif()
+
 # Check every compiled kernel source and the public/private header entry points.
 # context_gcc.S is retained as the reference for the adapted assembly in port/.
 foreach(required_file IN ITEMS ${kernel_srcs}
         "${RTTHREAD_ROOT}/include/rtthread.h"
         "${RTTHREAD_ROOT}/include/rthw.h"
-        "${RTTHREAD_ROOT}/libcpu/risc-v/common/context_gcc.S"
-        "${RTTHREAD_ROOT}/libcpu/risc-v/common/cpuport.h"
-        "${RTTHREAD_ROOT}/libcpu/risc-v/common/rt_hw_stack_frame.h")
+        "${rtt_riscv_port_dir}/context_gcc.S"
+        "${rtt_riscv_port_dir}/cpuport.h"
+        "${rtt_riscv_port_dir}/rt_hw_stack_frame.h")
     if(NOT EXISTS "${required_file}")
         message(FATAL_ERROR "RT-Thread source file is missing: ${required_file}. ${root_help}")
     endif()
@@ -106,6 +117,10 @@ elseif(CONFIG_IDF_TARGET_ESP32C6)
     set(target_srcs
         "port/esp32c6/cpuport.c")
     set(rtt_config_dir "${CMAKE_CURRENT_LIST_DIR}/port/esp32c6")
+elseif(CONFIG_IDF_TARGET_ESP32S31)
+    set(target_srcs
+        "port/esp32s31/cpuport.c")
+    set(rtt_config_dir "${CMAKE_CURRENT_LIST_DIR}/port/esp32s31")
 endif()
 
 # These flags are applied identically on both targets: the kernel, the shared
@@ -121,7 +136,7 @@ idf_component_register(SRCS ${srcs}
     # Upstream headers first, then this component's per-target config directory
     # (rtconfig.h) and cpuport.h / rt_hw_stack_frame.h from upstream libcpu.
     INCLUDE_DIRS "${RTTHREAD_ROOT}/include" "${rtt_config_dir}"
-    PRIV_INCLUDE_DIRS "${RTTHREAD_ROOT}/libcpu/risc-v/common" "${IDF_PATH}/components/freertos"
+    PRIV_INCLUDE_DIRS "${rtt_riscv_port_dir}" "${IDF_PATH}/components/freertos"
     PRIV_REQUIRES freertos riscv
     LDFRAGMENTS "linker.lf")
 

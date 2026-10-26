@@ -180,10 +180,12 @@ spurious_interrupt:
     LOAD  x1,   1 * REGBYTES(sp)
 
     LOAD  t0,   2 * REGBYTES(sp)
-#if CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C6
+#if CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32S31
     /* Common context_gcc.S stores only MPIE for a cooperative switch.
      * Such a frame can also be resumed here by the tick ISR. Keep MPP=M
      * without forcing MPIE: rt_schedule restores its caller's MIE later.
+     * ESP32-S31 is machine-mode only and uses the same cooperative frame
+     * layout, so it needs the same fix-up.
      */
     li    t1, 0x1800
     or    t0, t0, t1
@@ -223,4 +225,15 @@ spurious_interrupt:
     addi  sp, sp, 32 * REGBYTES
     mret
     .size  _interrupt_handler, .-_interrupt_handler
+
+/* No _mtvt_table here on purpose.
+ *
+ * CLIC targets compile vectors_clic.S unconditionally, and that file already
+ * defines _mtvt_table; its free-interrupt slots point at _interrupt_handler,
+ * which this file provides. Defining the table here as well would duplicate the
+ * symbol. On ESP32-S31 the CPU interrupt lines are 0..31 (SOC_CPU_INTR_NUM=32),
+ * the internal ones sit at 25..28, and everything the interrupt matrix routes
+ * lands on slots that resolve to _interrupt_handler.
+ */
+
 #endif /* CONFIG_IDF_RTOS_RTTHREAD */

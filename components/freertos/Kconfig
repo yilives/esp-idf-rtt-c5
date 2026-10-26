@@ -603,8 +603,8 @@ menu "FreeRTOS"
         default y
 
     config IDF_RTOS_RTTHREAD
-        bool "Replace FreeRTOS with RT-Thread (experimental, ESP32-C3/C6)"
-        depends on IDF_TARGET_ESP32C3 || IDF_TARGET_ESP32C6
+        bool "Replace FreeRTOS with RT-Thread (experimental, ESP32-C3/C6/S31)"
+        depends on IDF_TARGET_ESP32C3 || IDF_TARGET_ESP32C6 || IDF_TARGET_ESP32S31
         default n
         help
             Replaces the FreeRTOS interrupt entry and startup hooks with RT-Thread.
