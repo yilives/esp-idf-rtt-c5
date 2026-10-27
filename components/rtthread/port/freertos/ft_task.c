@@ -109,12 +109,23 @@ void ft_task_delay(ft_tick_t ticks)
     rt_thread_mdelay((rt_int32_t)(((rt_uint64_t)ticks * 1000u) / CONFIG_FREERTOS_HZ));
 }
 
+/* Defined with the TLS table further down; declared here because vTaskDelete
+ * has to release the per-slot delete callbacks before the thread disappears. */
+static void ft_tls_release(rt_thread_t thread);
+
 void ft_task_delete(void *handle)
 {
+    rt_thread_t thread = handle ? (rt_thread_t)handle : rt_thread_self();
+
+    /* FreeRTOS runs the TLSP deletion callbacks from prvDeleteTCB(), i.e. as
+     * part of the delete. IDF's esp_event relies on that to free the per-task
+     * state it hangs off index 0. */
+    ft_tls_release(thread);
+
     /* RT-Thread 5.x has no public rt_thread_exit(); rt_thread_delete() accepts
      * the calling thread and hands it to the reaper (src/thread.c:614 routes
      * through _thread_detach), which is what vTaskDelete(NULL) means. */
-    rt_thread_delete(handle ? (rt_thread_t)handle : rt_thread_self());
+    rt_thread_delete(thread);
 }
 
 void ft_task_suspend(void *handle)
@@ -159,6 +170,7 @@ struct ft_tls_entry
 {
     rt_thread_t thread;
     void       *value[FT_TLS_SLOTS];
+    ft_tls_del_cb_t cb[FT_TLS_SLOTS];
 };
 
 static struct ft_tls_entry s_tls[FT_TLS_THREADS];
@@ -191,6 +203,7 @@ static struct ft_tls_entry *ft_tls_lookup(rt_thread_t thread, rt_bool_t create)
     }
 
     rt_memset(free_entry->value, 0, sizeof(free_entry->value));
+    rt_memset(free_entry->cb, 0, sizeof(free_entry->cb));
     free_entry->thread = thread;
 
     return free_entry;
@@ -213,6 +226,69 @@ void ft_task_set_tls(void *handle, ft_ubase_t index, void *value)
     {
         entry->value[index] = value;
     }
+    rt_hw_interrupt_enable(level);
+}
+
+void ft_task_set_tls_with_cb(void *handle, ft_ubase_t index, void *value,
+                             ft_tls_del_cb_t cb)
+{
+    rt_thread_t thread = handle ? (rt_thread_t)handle : rt_thread_self();
+    rt_base_t   level;
+    struct ft_tls_entry *entry;
+
+    if (index >= FT_TLS_SLOTS)
+    {
+        return;
+    }
+
+    level = rt_hw_interrupt_disable();
+    entry = ft_tls_lookup(thread, RT_TRUE);
+    if (entry != RT_NULL)
+    {
+        entry->value[index] = value;
+        entry->cb[index]    = cb;
+    }
+    rt_hw_interrupt_enable(level);
+}
+
+/* Runs the callbacks and drops the slot. The callbacks are invoked with
+ * interrupts enabled: they are component code and may malloc/free. */
+static void ft_tls_release(rt_thread_t thread)
+{
+    struct ft_tls_entry *entry;
+    ft_tls_del_cb_t      cb;
+    void                *value;
+    rt_base_t            level;
+    int                  i;
+
+    level = rt_hw_interrupt_disable();
+    entry = ft_tls_lookup(thread, RT_FALSE);
+
+    if (entry == RT_NULL)
+    {
+        rt_hw_interrupt_enable(level);
+        return;
+    }
+
+    for (i = 0; i < FT_TLS_SLOTS; i++)
+    {
+        if (entry->value[i] == RT_NULL || entry->cb[i] == RT_NULL)
+        {
+            continue;
+        }
+
+        cb    = entry->cb[i];
+        value = entry->value[i];
+
+        entry->value[i] = RT_NULL;
+        entry->cb[i]    = RT_NULL;
+
+        rt_hw_interrupt_enable(level);
+        cb(i, value);
+        level = rt_hw_interrupt_disable();
+    }
+
+    entry->thread = RT_NULL;
     rt_hw_interrupt_enable(level);
 }
 

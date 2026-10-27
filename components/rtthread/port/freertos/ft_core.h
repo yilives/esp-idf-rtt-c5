@@ -268,6 +268,21 @@ ft_base_t ft_task_resume_all(void);
 void ft_task_set_tls(void *handle, ft_ubase_t index, void *value);
 void *ft_task_get_tls(void *handle, ft_ubase_t index);
 
+/**
+ * Set a pointer and a callback that runs when the task is deleted.
+ *
+ * IDF adds this on top of FreeRTOS (idf_additions.h, behind
+ * CONFIG_FREERTOS_TLSP_DELETION_CALLBACKS) so a component can hang malloc'ed
+ * state off a task and have it released with the task. esp_event uses it for the
+ * event loop's per-task bookkeeping; pthread_local_storage.c uses it too.
+ *
+ * The callback runs from ft_task_delete() before the thread object goes away.
+ */
+typedef void (*ft_tls_del_cb_t)(int index, void *value);
+
+void ft_task_set_tls_with_cb(void *handle, ft_ubase_t index, void *value,
+                             ft_tls_del_cb_t cb);
+
 /* ------------------------------------------------------- task notification -- */
 
 /*

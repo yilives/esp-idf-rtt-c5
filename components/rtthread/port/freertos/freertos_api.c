@@ -33,6 +33,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/event_groups.h"
+#include "freertos/idf_additions.h"
 
 #include "ft_core.h"
 
@@ -528,3 +529,18 @@ BaseType_t xTaskCheckForTimeOut(TimeOut_t *const pxTimeOut,
 
     return expired ? pdTRUE : pdFALSE;
 }
+
+/* ------------------------------------------------- IDF task additions -- */
+
+#if CONFIG_FREERTOS_TLSP_DELETION_CALLBACKS
+void vTaskSetThreadLocalStoragePointerAndDelCallback(TaskHandle_t xTaskToSet,
+                                                     BaseType_t xIndex,
+                                                     void *pvValue,
+                                                     TlsDeleteCallbackFunction_t pvDelCallback)
+{
+    /* esp_event hangs its per-task state on slot 0 with a free() callback, so
+     * the callback has to actually run: ft_task_delete() invokes it. */
+    ft_task_set_tls_with_cb(xTaskToSet, (ft_ubase_t)xIndex, pvValue,
+                            (ft_tls_del_cb_t)pvDelCallback);
+}
+#endif
