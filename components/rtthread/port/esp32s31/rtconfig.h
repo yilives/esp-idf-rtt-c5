@@ -65,6 +65,11 @@
 #define RT_SERIAL_RB_BUFSZ              64
 #define RT_USING_PIN
 
+/* PWM device class (components/drivers/misc/rt_drv_pwm.c). The LEDC driver
+ * registers "pwm0" through it, which is what makes rt_pwm_set()/rt_pwm_enable()
+ * and msh's `pwm` command available. */
+#define RT_USING_PWM
+
 /* Console and shell.
  *
  * FINSH_USING_SYMTAB needs __fsymtab_start/__fsymtab_end and the .rti_fn*

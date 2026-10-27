@@ -127,6 +127,7 @@ set(finsh_srcs
 set(serial_srcs
     "${RTTHREAD_ROOT}/components/drivers/serial/dev_serial.c"
     "${RTTHREAD_ROOT}/components/drivers/pin/dev_pin.c"
+    "${RTTHREAD_ROOT}/components/drivers/misc/rt_drv_pwm.c"
     "${RTTHREAD_ROOT}/components/drivers/ipc/completion_up.c"
     "${RTTHREAD_ROOT}/components/drivers/ipc/completion_comm.c")
 
@@ -147,6 +148,8 @@ elseif(CONFIG_IDF_TARGET_ESP32S31)
         "port/esp32s31/interrupt.c"
         "port/esp32s31/serial.c"
         "port/esp32s31/gpio.c"
+        "port/esp32s31/pwm.c"
+        "port/esp32s31/gptimer.c"
         "port/esp32s31/selftest.c")
     # FreeRTOS-compatible primitives on rt_*. Target independent, but only S31
     # needs them today; they exist so the IDF components that call FreeRTOS APIs
@@ -186,9 +189,11 @@ set_source_files_properties(${finsh_srcs} ${serial_srcs} PROPERTIES
 set(srcs ${kernel_srcs} ${common_srcs} ${target_srcs} ${finsh_srcs} ${serial_srcs} "port/common/board.c")
 
 if(CONFIG_IDF_TARGET_ESP32S31)
-    # The self test exports an msh command through MSH_CMD_EXPORT_ALIAS, which
-    # hits the same cast-function-type warning as finsh itself.
-    set_source_files_properties("port/esp32s31/selftest.c" PROPERTIES
+    # The self test and the timer probe export msh commands through
+    # MSH_CMD_EXPORT_ALIAS, which hits the same cast-function-type warning as
+    # finsh itself.
+    set_source_files_properties("port/esp32s31/selftest.c" "port/esp32s31/gptimer.c"
+                            "port/esp32s31/pwm.c" PROPERTIES
         COMPILE_DEFINITIONS "__RTTHREAD__;__RT_KERNEL_SOURCE__"
         COMPILE_OPTIONS "-ffreestanding;-fno-builtin;-Wno-cast-function-type")
 endif()
@@ -224,3 +229,13 @@ if(CONFIG_IDF_TARGET_ESP32S31)
 endif()
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     RT_MAIN_THREAD_STACK_SIZE=CONFIG_ESP_MAIN_TASK_STACK_SIZE)
+
+# esp_hal_ledc and esp_hal_timg are the two HAL components port/esp32s31/
+# {pwm,gptimer}.c reach directly. They are not part of the `hal` umbrella - IDF
+# only pulls them in through esp_driver_ledc / esp_driver_gptimer, which this
+# port does not use - and listing them in PRIV_REQUIRES does not put their
+# include directories on this component's compile line (the -I list in
+# build/compile_commands.json stays unchanged). Linking the component aliases
+# does carry both the headers and the archives, which is what the LEDC signal
+# table in ledc_periph.c needs at link time.
+target_link_libraries(${COMPONENT_LIB} PRIVATE idf::esp_hal_ledc idf::esp_hal_timg)
