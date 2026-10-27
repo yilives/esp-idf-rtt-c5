@@ -46,6 +46,7 @@
 #include "riscv/interrupt.h"
 #include "esp_rom_sys.h"
 
+#include "ft_core.h"
 #include "port_intr.h"
 #include "port_selftest.h"
 
@@ -860,6 +861,338 @@ static int st_sem(void)
     return ok ? ST_PASS : ST_FAIL;
 }
 
+/* ---------------------------------------------------------------- fbshim -- */
+
+/*
+ * Exercises the FreeRTOS-compatible primitives in port/freertos/.
+ *
+ * These are not used by anything in the image yet: they exist so that
+ * esp_driver_uart, esp_event, esp_netif, lwip and eventually esp_wifi can run on
+ * RT-Thread. Testing them here means the semantics they depend on - blocking,
+ * timeouts, capacity accounting, event bit clearing - are proven on the board
+ * before a driver is built on top of them.
+ */
+
+struct st_shim_msg
+{
+    rt_uint32_t seq;
+    rt_uint32_t payload[3];
+};
+
+#define ST_SHIM_ITEMS   6
+
+static struct ft_ipc *s_shim_queue;
+static rt_uint32_t    s_shim_produced;
+
+static void st_shim_producer(void *arg)
+{
+    struct st_shim_msg m;
+    rt_uint32_t i;
+
+    RT_UNUSED(arg);
+
+    for (i = 0; i < ST_SHIM_ITEMS; i++)
+    {
+        m.seq        = 0x1000u + i;
+        m.payload[0] = i;
+        m.payload[1] = ~i;
+        m.payload[2] = i * 3u;
+
+        /* Blocks when the queue is full: the consumer starts slower. */
+        if (ft_ipc_send(s_shim_queue, &m, FT_MAX_DELAY) == FT_OK)
+        {
+            s_shim_produced++;
+        }
+
+        ft_task_delay(5);
+    }
+}
+
+static int st_fbshim(void)
+{
+    struct st_shim_msg m;
+    struct ft_ipc     *q2 = RT_NULL;
+    struct ft_ipc     *sem = RT_NULL;
+    struct ft_ipc     *mtx = RT_NULL;
+    struct ft_event   *ev = RT_NULL;
+    rt_thread_t        producer = RT_NULL;
+    rt_uint32_t        i;
+    int                bad;
+    int                total_bad = 0;
+
+    /* ---- 1. queue capacity and FIFO order ---- */
+    bad = 0;
+    s_shim_queue = ft_ipc_create(4, sizeof(struct st_shim_msg));
+    if (s_shim_queue == RT_NULL)
+    {
+        st_report("fbshim", ST_FAIL, "queue create failed");
+        return ST_FAIL;
+    }
+
+    for (i = 0; i < 4; i++)
+    {
+        m.seq = 100 + i;
+        m.payload[0] = i;
+        m.payload[1] = 0;
+        m.payload[2] = 0;
+        if (ft_ipc_send(s_shim_queue, &m, FT_NO_WAIT) != FT_OK)
+        {
+            bad++;
+        }
+    }
+
+    if (ft_ipc_send(s_shim_queue, &m, FT_NO_WAIT) != FT_ERR_FULL)
+    {
+        bad++;                      /* a full queue must refuse, not block */
+    }
+    if (ft_ipc_messages_waiting(s_shim_queue) != 4 ||
+        ft_ipc_spaces_available(s_shim_queue) != 0)
+    {
+        bad++;
+    }
+
+    for (i = 0; i < 4; i++)
+    {
+        if (ft_ipc_receive(s_shim_queue, &m, FT_NO_WAIT) != FT_OK || m.seq != 100 + i)
+        {
+            bad++;
+        }
+    }
+
+    if (ft_ipc_receive(s_shim_queue, &m, FT_NO_WAIT) != FT_ERR_TIMEOUT)
+    {
+        bad++;                      /* an empty queue must report empty */
+    }
+
+    total_bad += bad;
+    st_report("fbshim/q", bad == 0, "cap 4, FIFO, full+empty refusal (%d bad)", bad);
+
+    /* ---- 2. blocking in both directions across tasks ---- */
+    bad = 0;
+    ft_ipc_delete(s_shim_queue);
+    s_shim_queue   = ft_ipc_create(2, sizeof(struct st_shim_msg));
+    s_shim_produced = 0;
+
+    if (s_shim_queue == RT_NULL ||
+        ft_task_create("stprod", st_shim_producer, RT_NULL, 512, 12, (void **)&producer) == RT_NULL)
+    {
+        st_report("fbshim/blk", ST_FAIL, "setup failed");
+        if (s_shim_queue) ft_ipc_delete(s_shim_queue);
+        return ST_FAIL;
+    }
+
+    for (i = 0; i < ST_SHIM_ITEMS; i++)
+    {
+        if (ft_ipc_receive(s_shim_queue, &m, FT_MAX_DELAY) != FT_OK)
+        {
+            bad++;
+            break;
+        }
+        if (m.seq != 0x1000u + i || m.payload[0] != i || m.payload[1] != ~i ||
+            m.payload[2] != i * 3u)
+        {
+            bad++;                  /* order or payload corruption */
+        }
+        ft_task_delay(2);           /* slower than the producer on purpose */
+    }
+
+    for (i = 0; i < 200 && s_shim_produced < ST_SHIM_ITEMS; i++)
+    {
+        ft_task_delay(2);
+    }
+    if (s_shim_produced != ST_SHIM_ITEMS || bad != 0)
+    {
+        bad++;
+    }
+
+    total_bad += bad;
+    st_report("fbshim/blk", bad == 0, "%u/%d produced, order preserved (%d bad)",
+              s_shim_produced, ST_SHIM_ITEMS, bad);
+
+    /* ---- 3. timeout accuracy on an empty queue ---- */
+    bad = 0;
+    {
+        rt_uint64_t t0, t1;
+        int rc;
+
+        ft_ipc_delete(s_shim_queue);
+        s_shim_queue = ft_ipc_create(2, sizeof(struct st_shim_msg));
+
+        t0 = st_now_us();
+        rc = ft_ipc_receive(s_shim_queue, &m, 50);
+        t1 = st_now_us();
+
+        if (rc != FT_ERR_TIMEOUT)
+        {
+            bad++;
+        }
+        /* 50 ms requested; allow scheduling slack but not a 10x error. */
+        if ((t1 - t0) < 40000u || (t1 - t0) > 500000u)
+        {
+            bad++;
+        }
+
+        total_bad += bad;
+        st_report("fbshim/to", bad == 0, "50 ms timeout took %u us (%d bad)",
+                  (rt_uint32_t)(t1 - t0), bad);
+    }
+
+    /* ---- 4. semaphores and mutex ---- */
+    bad = 0;
+    sem = ft_ipc_create_sem(3, 0);
+    mtx = ft_ipc_create_mutex();
+
+    if (sem == RT_NULL || mtx == RT_NULL)
+    {
+        bad++;
+    }
+    else
+    {
+        /* counting semaphore: 3 gives, 4 takes, the last must fail */
+        for (i = 0; i < 3; i++)
+        {
+            if (ft_ipc_give(sem) != FT_OK)
+            {
+                bad++;
+            }
+        }
+        for (i = 0; i < 3; i++)
+        {
+            if (ft_ipc_take(sem, FT_NO_WAIT) != FT_OK)
+            {
+                bad++;
+            }
+        }
+        if (ft_ipc_take(sem, FT_NO_WAIT) != FT_ERR_TIMEOUT)
+        {
+            bad++;
+        }
+        if (ft_ipc_give(sem) != FT_OK || ft_ipc_take(sem, FT_NO_WAIT) != FT_OK)
+        {
+            bad++;                  /* a semaphore must be reusable */
+        }
+
+        /* mutex is not recursive: a second take by the owner must fail */
+        if (ft_ipc_take(mtx, FT_NO_WAIT) != FT_OK)
+        {
+            bad++;
+        }
+        if (ft_ipc_take(mtx, FT_NO_WAIT) != FT_ERR_TIMEOUT)
+        {
+            bad++;
+        }
+        if (ft_ipc_give(mtx) != FT_OK || ft_ipc_take(mtx, FT_NO_WAIT) != FT_OK)
+        {
+            bad++;
+        }
+        ft_ipc_give(mtx);
+    }
+
+    total_bad += bad;
+    st_report("fbshim/sem", bad == 0, "counting 3 max, mutex not recursive (%d bad)", bad);
+
+    /* ---- 5. event group ---- */
+    bad = 0;
+    ev = ft_event_create();
+    if (ev == RT_NULL)
+    {
+        bad++;
+    }
+    else
+    {
+        if (ft_event_set_bits(ev, 0x3) != 0x3)
+        {
+            bad++;
+        }
+        /* OR wait without clearing returns the whole set, not just the match */
+        if (ft_event_wait_bits(ev, 0x1, ftFAIL, ftFAIL, FT_NO_WAIT) != 0x3)
+        {
+            bad++;
+        }
+        /* AND wait that cannot be satisfied times out and returns 0 */
+        if (ft_event_wait_bits(ev, 0x5, ftFAIL, ftPASS, 20) != 0)
+        {
+            bad++;
+        }
+        /* partial clear must not touch the other bits */
+        if (ft_event_clear_bits(ev, 0x2) != 0x1)
+        {
+            bad++;
+        }
+        /* clear-on-exit: matched bits are gone afterwards */
+        if (ft_event_set_bits(ev, 0x4) != 0x5)
+        {
+            bad++;
+        }
+        if (ft_event_wait_bits(ev, 0x5, ftPASS, ftPASS, FT_NO_WAIT) != 0x5)
+        {
+            bad++;
+        }
+        if (ft_event_get_bits(ev) != 0)
+        {
+            bad++;
+        }
+    }
+
+    total_bad += bad;
+    st_report("fbshim/ev", bad == 0, "or/and wait, partial clear, clear-on-exit (%d bad)", bad);
+
+    /* ---- 6. TLS ---- */
+    bad = 0;
+    {
+        rt_uint32_t marker = 0xA5A5u;
+        rt_uint32_t volatile *slot;
+
+        ft_task_set_tls(RT_NULL, 0, (void *)&marker);
+        slot = (rt_uint32_t volatile *)ft_task_get_tls(RT_NULL, 0);
+        if (slot != &marker || (slot && *slot != 0xA5A5u))
+        {
+            bad++;
+        }
+        if (ft_task_get_tls(RT_NULL, 1) != RT_NULL)
+        {
+            bad++;                  /* untouched slot must read back NULL */
+        }
+        ft_task_set_tls(RT_NULL, 0, RT_NULL);
+        if (ft_task_get_tls(RT_NULL, 0) != RT_NULL)
+        {
+            bad++;
+        }
+    }
+
+    total_bad += bad;
+    st_report("fbshim/tls", bad == 0, "per-thread slots, untouched reads NULL (%d bad)", bad);
+
+    /* ---- cleanup ---- */
+    if (producer != RT_NULL)
+    {
+        ft_task_delete(producer);
+    }
+    if (s_shim_queue)
+    {
+        ft_ipc_delete(s_shim_queue);
+        s_shim_queue = RT_NULL;
+    }
+    if (q2)
+    {
+        ft_ipc_delete(q2);
+    }
+    if (sem)
+    {
+        ft_ipc_delete(sem);
+    }
+    if (mtx)
+    {
+        ft_ipc_delete(mtx);
+    }
+    if (ev)
+    {
+        ft_event_delete(ev);
+    }
+
+    return total_bad ? ST_FAIL : ST_PASS;
+}
+
 /* --------------------------------------------------------------- driver -- */
 
 static int st_all(int seconds, rt_base_t pin)
@@ -881,6 +1214,7 @@ static int st_all(int seconds, rt_base_t pin)
     st_irq(pin);
     st_nest(pin);
     st_sem();
+    st_fbshim();
 
     rt_kprintf("=== %d passed, %d failed ===\n\n", s_pass, s_fail);
 
@@ -949,6 +1283,11 @@ static int st_cmd(int argc, char **argv)
     if (rt_strcmp(argv[1], "sem") == 0)
     {
         return st_sem();
+    }
+
+    if (rt_strcmp(argv[1], "fbshim") == 0)
+    {
+        return st_fbshim();
     }
 
     st_usage();

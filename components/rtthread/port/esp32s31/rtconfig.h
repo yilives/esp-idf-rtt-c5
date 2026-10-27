@@ -43,6 +43,9 @@
 
 #define RT_USING_SEMAPHORE
 #define RT_USING_MUTEX
+/* Event groups. port/freertos/ft_event.c maps xEventGroup* onto rt_event, and
+ * esp_wifi/esp_event/lwip all use event groups, so this is not optional. */
+#define RT_USING_EVENT
 
 /* Device framework + serial v1 + pin.
  *

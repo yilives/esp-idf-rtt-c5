@@ -148,6 +148,14 @@ elseif(CONFIG_IDF_TARGET_ESP32S31)
         "port/esp32s31/serial.c"
         "port/esp32s31/gpio.c"
         "port/esp32s31/selftest.c")
+    # FreeRTOS-compatible primitives on rt_*. Target independent, but only S31
+    # needs them today; they exist so the IDF components that call FreeRTOS APIs
+    # (esp_driver_uart, esp_event, esp_netif, lwip, esp_wifi) can run on
+    # RT-Thread without being rewritten. See port/freertos/ft_core.h.
+    list(APPEND target_srcs
+        "port/freertos/ft_ipc.c"
+        "port/freertos/ft_event.c"
+        "port/freertos/ft_task.c")
     set(rtt_config_dir "${CMAKE_CURRENT_LIST_DIR}/port/esp32s31")
 endif()
 
@@ -182,6 +190,7 @@ idf_component_register(SRCS ${srcs}
     INCLUDE_DIRS "${RTTHREAD_ROOT}/include" "${RTTHREAD_ROOT}/components/finsh"
                  "${RTTHREAD_ROOT}/components/drivers/include" "${rtt_config_dir}"
     PRIV_INCLUDE_DIRS "${rtt_riscv_port_dir}" "${IDF_PATH}/components/freertos"
+                      "${CMAKE_CURRENT_LIST_DIR}/port/freertos"
     PRIV_REQUIRES freertos riscv esp_rom soc hal esp_hal_uart esp_hal_gpio
     LDFRAGMENTS "linker.lf")
 
