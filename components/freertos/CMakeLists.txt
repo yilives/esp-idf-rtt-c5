@@ -67,14 +67,26 @@ if((arch STREQUAL "xtensa") OR (arch STREQUAL "riscv"))
         "port_systick.c")
 endif()
 
-# Add FreeRTOS Kernel source files
+# Add FreeRTOS Kernel source files.
+#
+# When the RT-Thread shim is enabled the scheduler is not built at all: its API
+# surface comes from components/rtthread/port/freertos/freertos_api.c instead.
+# list.c stays because the port layer and the esp_additions helpers use its
+# linked-list primitives directly. port.c / port_systick.c / port_common.c also
+# stay: they provide the RT-Thread tick (vPortSetupTimer) and the critical
+# sections, and they link cleanly without the scheduler because --gc-sections
+# drops the entry points nothing calls.
 list(APPEND srcs
-    "${kernel_impl}/list.c"
-    "${kernel_impl}/queue.c"
-    "${kernel_impl}/tasks.c"
-    "${kernel_impl}/timers.c"
-    "${kernel_impl}/event_groups.c"
-    "${kernel_impl}/stream_buffer.c")
+    "${kernel_impl}/list.c")
+
+if(NOT CONFIG_IDF_RTOS_RTTHREAD_FREERTOS_SHIM)
+    list(APPEND srcs
+        "${kernel_impl}/queue.c"
+        "${kernel_impl}/tasks.c"
+        "${kernel_impl}/timers.c"
+        "${kernel_impl}/event_groups.c"
+        "${kernel_impl}/stream_buffer.c")
+endif()
 
 # Add port source files
 list(APPEND srcs

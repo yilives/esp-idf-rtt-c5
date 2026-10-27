@@ -631,6 +631,26 @@ menu "FreeRTOS"
             (__heap_start__/__heap_end__). Coexists with the IDF heap. Default
             keeps the previous hardcoded 40 KB.
 
+    config IDF_RTOS_RTTHREAD_FREERTOS_SHIM
+        bool "Provide FreeRTOS APIs from RT-Thread (drop the FreeRTOS scheduler)"
+        depends on IDF_RTOS_RTTHREAD
+        default n
+        help
+            Stops compiling the FreeRTOS scheduler (queue.c, tasks.c, timers.c,
+            event_groups.c, stream_buffer.c) and provides the same API surface
+            from components/rtthread/port/freertos/ instead. The port layer
+            (port.c, port_systick.c, port_common.c, portasm.S, list.c) is kept,
+            because the RT-Thread tick and the critical sections come from it.
+
+            Leave this off until the target has been validated: with it on,
+            spi_flash, esp_libc's newlib locks and esp_coex all run on the shim,
+            and a semantic mistake there breaks the system during boot rather
+            than in the component that asked for it.
+
+            This is step W3 of rtthread-esp32-s31-wifi-feasibility.md and it is
+            what makes esp_driver_uart and eventually esp_wifi usable on
+            RT-Thread. Verify with `s31test fbshim` before enabling.
+
     config FREERTOS_NO_AFFINITY
         # This invisible config value sets the value of tskNO_AFFINITY in task.h.
         # Intended to be used as a constant from other Kconfig files.

@@ -156,6 +156,13 @@ elseif(CONFIG_IDF_TARGET_ESP32S31)
         "port/freertos/ft_ipc.c"
         "port/freertos/ft_event.c"
         "port/freertos/ft_task.c")
+
+    # The thin xQueueCreate -> ft_ipc_create mapping. Only built when the real
+    # FreeRTOS scheduler is switched off: defining those symbols while
+    # libfreertos.a still defines them makes the winner depend on archive order.
+    if(CONFIG_IDF_RTOS_RTTHREAD_FREERTOS_SHIM)
+        list(APPEND target_srcs "port/freertos/freertos_api.c")
+    endif()
     set(rtt_config_dir "${CMAKE_CURRENT_LIST_DIR}/port/esp32s31")
 endif()
 

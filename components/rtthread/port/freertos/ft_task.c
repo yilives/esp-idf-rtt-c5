@@ -8,10 +8,13 @@
  *    ft_prio_to_rt()/ft_prio_to_ft() so the sign can never be flipped in one
  *    place and not another.
  *
- * 2. Stack sizes are counted in different units. FreeRTOS's xTaskCreate takes
- *    StackType_t units, which are 32-bit words here; rt_thread_create takes
- *    bytes. Forgetting the x4 gives a task with a quarter of the stack it asked
- *    for, which usually survives until the first deep call chain.
+ * 2. Stack sizes. FreeRTOS documents xTaskCreate's depth in words, but IDF's
+ *    RISC-V port defines StackType_t as uint8_t, so the unit here is a byte and
+ *    rt_thread_create wants bytes too - the conversion factor is
+ *    FT_STACK_UNIT_BYTES (1). Getting this from the documentation instead of
+ *    from portmacro.h gives a task four times the stack it asked for, which is
+ *    quiet and wasteful rather than fatal, and that is exactly why it survives
+ *    review.
  *
  * 3. rt_thread_control(RT_THREAD_CTRL_CHANGE_PRIORITY) dereferences its
  *    argument as a pointer to rt_uint8_t (src/thread.c:845), so the value has
@@ -59,7 +62,7 @@ ft_ubase_t ft_prio_to_ft(rt_uint8_t prio)
 void *ft_task_create(const char *name, void (*entry)(void *), void *param,
                      ft_ubase_t stack_words, ft_ubase_t prio, void **handle)
 {
-    rt_uint32_t stack_bytes = (rt_uint32_t)stack_words * sizeof(rt_uint32_t);
+    rt_uint32_t stack_bytes = (rt_uint32_t)stack_words * FT_STACK_UNIT_BYTES;
     rt_thread_t thread;
 
     if (handle != RT_NULL)

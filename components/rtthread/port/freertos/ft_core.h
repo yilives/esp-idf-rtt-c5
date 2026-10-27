@@ -43,6 +43,18 @@ typedef rt_uint32_t     ft_tick_t;
 #define ftPASS              ((ft_base_t)1)
 #define ftFAIL              ((ft_base_t)0)
 
+/*
+ * Bytes per FreeRTOS stack unit.
+ *
+ * FreeRTOS documents xTaskCreate's stack depth in words, but that is only true
+ * when the port defines StackType_t as a 32-bit type. IDF's RISC-V port defines
+ * it as uint8_t (portmacro.h:101), so a depth of 2048 means 2048 *bytes*.
+ * freertos_api.c asserts sizeof(StackType_t) == this constant, so a port that
+ * ever changes its mind breaks the build instead of silently quadrupling every
+ * task stack.
+ */
+#define FT_STACK_UNIT_BYTES 1
+
 /* Timeout arguments, matching portMAX_DELAY / 0. */
 #define FT_NO_WAIT          ((ft_tick_t)0)
 #define FT_MAX_DELAY        ((ft_tick_t)0xFFFFFFFFu)
@@ -165,8 +177,9 @@ ft_ubase_t ft_prio_to_ft(rt_uint8_t prio);
 /**
  * Create and start a task.
  *
- * @param stack_words stack size in StackType_t units (32-bit words), which is
- *                    what FreeRTOS counts in; RT-Thread counts bytes
+ * @param stack_words stack size in StackType_t units; on this port one unit is
+ *                    one byte (FT_STACK_UNIT_BYTES), rt_thread_create also
+ *                    takes bytes
  * @param handle      receives the thread, may be NULL
  */
 void *ft_task_create(const char *name, void (*entry)(void *),
