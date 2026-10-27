@@ -35,6 +35,21 @@ extern "C" {
  */
 int rt_hw_intr_route(int source, int inum);
 
+/**
+ * Set the CLIC level of a CPU interrupt line.
+ *
+ * rt_hw_interrupt_install() gives a line level 1 the first time a handler is
+ * attached, which is the weakest level the CLIC threshold lets through. Two
+ * lines need different levels to nest, so a driver that wants to be preemptible
+ * by a higher priority source must raise it here. Do this BEFORE
+ * rt_hw_interrupt_install(), which only fills in a level when the line is still
+ * at 0.
+ *
+ * @param vector   ETS INUM
+ * @param priority CLIC level, 1..(2^NLBITS - 1); 0 means "masked"
+ */
+void rt_hw_interrupt_set_priority(int vector, rt_uint32_t priority);
+
 #ifdef __cplusplus
 }
 #endif

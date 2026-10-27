@@ -21,6 +21,7 @@
 #include <rtthread.h>
 #include <rtdevice.h>
 
+#include "sdkconfig.h"
 #include "soc/soc.h"
 #include "soc/uart_struct.h"
 #include "soc/uart_reg.h"
@@ -29,6 +30,13 @@
 
 #include "port_intr.h"
 #include "port_serial.h"
+
+/* Rate the ROM console was configured with. sdkconfig owns it; the fallback
+ * only covers a build where the console is disabled. */
+#ifndef CONFIG_ESP_CONSOLE_UART_BAUDRATE
+#define CONFIG_ESP_CONSOLE_UART_BAUDRATE 115200
+#endif
+#define S31_UART0_BAUD          CONFIG_ESP_CONSOLE_UART_BAUDRATE
 
 /* RX timeout in bit times: raise an interrupt for a short burst instead of
  * waiting for the FIFO to fill, which is what makes an interactive shell work. */
@@ -47,10 +55,19 @@ static rt_err_t s31_uart_configure(struct rt_serial_device *serial,
      * is the RX timeout, so a single typed character interrupts. */
     uart_ll_set_rx_tout(&UART0, UART0_RX_TOUT_THRESH);
 
-    if (cfg->baud_rate != 115200)
+    if (cfg->baud_rate != S31_UART0_BAUD)
     {
-        rt_kprintf("uart0: baud %d not applied, ROM console left at 115200\n",
-                   cfg->baud_rate);
+        /* Honest failure instead of a silent no-op. Changing the rate needs the
+         * UART source clock frequency, and S31's uart_ll.h has no
+         * uart_ll_get_sclk()/uart_ll_set_sclk() pair (only the LP UART does),
+         * so the currently selected source cannot be read back and the mux
+         * cannot be repointed through the LL. Deriving it from the programmed
+         * divider and the assumed console baud would work but fails silently
+         * and wrongly if the assumption is off, which is the one failure mode
+         * that leaves the board with no console at all. */
+        rt_kprintf("uart0: %d baud not supported, console stays at %d\n",
+                   cfg->baud_rate, S31_UART0_BAUD);
+        return -RT_EINVAL;
     }
 
     return RT_EOK;
@@ -142,6 +159,11 @@ static void s31_uart_isr(int vector, void *param)
 int rt_hw_uart0_init(void)
 {
     struct serial_configure config = RT_SERIAL_CONFIG_DEFAULT;
+
+    /* Report the rate the console is really running at, so a mismatch with
+     * RT_SERIAL_CONFIG_DEFAULT's 115200 shows up at open() rather than as
+     * garbled output. */
+    config.baud_rate = S31_UART0_BAUD;
 
     serial0.ops    = &s31_uart_ops;
     serial0.config = config;

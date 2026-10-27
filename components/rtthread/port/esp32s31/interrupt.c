@@ -29,6 +29,12 @@
  *    the matrix starts with all sources on CPU line 0. rt_hw_intr_route()
  *    performs step 1; without it the handler is never reached and the only
  *    visible symptom is a peripheral that stays silent.
+ *
+ * 5. Level. On CLIC the threshold check is `int_ctl_byte > mintthresh_byte`,
+ *    mintthresh is 0 (encoded 0x1F) and an external interrupt resets to level
+ *    0 (also 0x1F). Installing a handler therefore has to assign a level as
+ *    well, otherwise step 3 (unmask the line) is a no-op. See
+ *    RTT_INTR_DEFAULT_LEVEL.
  */
 
 #include <rthw.h>
@@ -43,6 +49,17 @@
 
 /* ETS INUM range. Slot arithmetic lives in the assembly, not here. */
 #define RTT_INUM_NUM        SOC_CPU_INTR_NUM
+
+/*
+ * CLIC masks every interrupt whose level is <= mintthresh, and board.c programs
+ * mintthresh to RVHAL_INTR_ENABLE_THRESH (0). An external interrupt also resets
+ * to level 0, and CLIC_INT_THRESH encodes 0 as 0x1F, so the comparison
+ * 0x1F > 0x1F fails: a line can be routed, enabled and unmasked and still never
+ * be taken. IDF avoids this by always programming a level in esp_intr_alloc();
+ * this bridge has to do the same. Level 1 is IDF's ESP_INTR_FLAG_LEVEL1, the
+ * weakest level above the threshold.
+ */
+#define RTT_INTR_DEFAULT_LEVEL  1
 
 struct rtt_isr_ctx
 {
@@ -91,6 +108,14 @@ rt_isr_handler_t rt_hw_interrupt_install(int              vector,
     if (handler != RT_NULL)
     {
         intr_handler_set(vector, rtt_trampoline, &s_ctx[vector]);
+
+        /* Only when the line is still at its reset level, so a caller that
+         * deliberately pre-set a level (rt_hw_interrupt_set_priority before
+         * installing, which is what drivers wanting nesting do) keeps it. */
+        if (esprv_int_get_priority(vector) == 0)
+        {
+            esprv_int_set_priority(vector, RTT_INTR_DEFAULT_LEVEL);
+        }
     }
     else
     {
