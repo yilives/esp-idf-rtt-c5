@@ -18,6 +18,22 @@
 #define LOAD                    lw
 #define REGBYTES                4
 
+/* The frame must match rt_hw_stack_frame_t (32 integer slots first, then
+ * f0..f31 at higher addresses) and port/common/context_gcc.S.
+ * __riscv_flen comes from the toolchain -march (the S31 arch string carries
+ * f2p2), so this is a property of the build, not an rtconfig.h option. */
+#if defined(__riscv_flen) && (__riscv_flen == 32)
+#define RT_FPU_FRAME            1
+#define FPREG_BYTES             4
+#define FPSTORE                 fsw
+#define FPLOAD                  flw
+#elif defined(__riscv_flen) && (__riscv_flen == 64)
+#define RT_FPU_FRAME            1
+#define FPREG_BYTES             8
+#define FPSTORE                 fsd
+#define FPLOAD                  fld
+#endif
+
     .section .exception_vectors.text, "ax"
     .global _interrupt_handler
     .global _tee_interrupt_handler
@@ -29,7 +45,18 @@
  * whether to switch to to_thread. */
 _interrupt_handler:
 _tee_interrupt_handler:
-    /* Save the outermost context on the thread stack and nested contexts on the interrupt stack. */
+    /* Save the outermost context on the thread stack and nested contexts on the interrupt stack.
+     *
+     * The frame must have exactly the same shape as the one context_gcc.S builds
+     * for a cooperative switch: 32 integer slots followed by 32 FP slots at
+     * higher addresses. If the interrupt frame were smaller, the trap exit would
+     * return with sp short by the FP area whenever it resumes a cooperatively
+     * switched thread - and that corrupts pure-integer threads as well, no
+     * floating point needs to be involved.
+     */
+#ifdef RT_FPU_FRAME
+    addi sp, sp, -32 * FPREG_BYTES          /* FP slots live at the higher addresses. */
+#endif
     addi sp, sp, -32 * REGBYTES             /* Allocate a frame for 32 CPU registers. */
     STORE x1,   1 * REGBYTES(sp)            /* Save ra. */
 
@@ -68,6 +95,45 @@ _tee_interrupt_handler:
     STORE x29, 29 * REGBYTES(sp)
     STORE x30, 30 * REGBYTES(sp)
     STORE x31, 31 * REGBYTES(sp)
+
+#ifdef RT_FPU_FRAME
+    /* mstatus.FS is non-zero in every context this entry can run on:
+     * rt_hw_stack_init_core() builds thread frames with mstatus=0x7880, and
+     * rtthread_startup() keeps MIE off until the first thread's mret, so no
+     * interrupt can arrive with the FPU disabled. */
+    FPSTORE f0,  (32 * REGBYTES +  0 * FPREG_BYTES)(sp)
+    FPSTORE f1,  (32 * REGBYTES +  1 * FPREG_BYTES)(sp)
+    FPSTORE f2,  (32 * REGBYTES +  2 * FPREG_BYTES)(sp)
+    FPSTORE f3,  (32 * REGBYTES +  3 * FPREG_BYTES)(sp)
+    FPSTORE f4,  (32 * REGBYTES +  4 * FPREG_BYTES)(sp)
+    FPSTORE f5,  (32 * REGBYTES +  5 * FPREG_BYTES)(sp)
+    FPSTORE f6,  (32 * REGBYTES +  6 * FPREG_BYTES)(sp)
+    FPSTORE f7,  (32 * REGBYTES +  7 * FPREG_BYTES)(sp)
+    FPSTORE f8,  (32 * REGBYTES +  8 * FPREG_BYTES)(sp)
+    FPSTORE f9,  (32 * REGBYTES +  9 * FPREG_BYTES)(sp)
+    FPSTORE f10, (32 * REGBYTES + 10 * FPREG_BYTES)(sp)
+    FPSTORE f11, (32 * REGBYTES + 11 * FPREG_BYTES)(sp)
+    FPSTORE f12, (32 * REGBYTES + 12 * FPREG_BYTES)(sp)
+    FPSTORE f13, (32 * REGBYTES + 13 * FPREG_BYTES)(sp)
+    FPSTORE f14, (32 * REGBYTES + 14 * FPREG_BYTES)(sp)
+    FPSTORE f15, (32 * REGBYTES + 15 * FPREG_BYTES)(sp)
+    FPSTORE f16, (32 * REGBYTES + 16 * FPREG_BYTES)(sp)
+    FPSTORE f17, (32 * REGBYTES + 17 * FPREG_BYTES)(sp)
+    FPSTORE f18, (32 * REGBYTES + 18 * FPREG_BYTES)(sp)
+    FPSTORE f19, (32 * REGBYTES + 19 * FPREG_BYTES)(sp)
+    FPSTORE f20, (32 * REGBYTES + 20 * FPREG_BYTES)(sp)
+    FPSTORE f21, (32 * REGBYTES + 21 * FPREG_BYTES)(sp)
+    FPSTORE f22, (32 * REGBYTES + 22 * FPREG_BYTES)(sp)
+    FPSTORE f23, (32 * REGBYTES + 23 * FPREG_BYTES)(sp)
+    FPSTORE f24, (32 * REGBYTES + 24 * FPREG_BYTES)(sp)
+    FPSTORE f25, (32 * REGBYTES + 25 * FPREG_BYTES)(sp)
+    FPSTORE f26, (32 * REGBYTES + 26 * FPREG_BYTES)(sp)
+    FPSTORE f27, (32 * REGBYTES + 27 * FPREG_BYTES)(sp)
+    FPSTORE f28, (32 * REGBYTES + 28 * FPREG_BYTES)(sp)
+    FPSTORE f29, (32 * REGBYTES + 29 * FPREG_BYTES)(sp)
+    FPSTORE f30, (32 * REGBYTES + 30 * FPREG_BYTES)(sp)
+    FPSTORE f31, (32 * REGBYTES + 31 * FPREG_BYTES)(sp)
+#endif
 
     /* Keep this level's context pointer until it is stored in its own interrupt stack slot. */
     mv    t1, sp
@@ -226,6 +292,45 @@ spurious_interrupt:
     LOAD  x31, 31 * REGBYTES(sp)
 
     addi  sp, sp, 32 * REGBYTES
+
+#ifdef RT_FPU_FRAME
+    /* Paired with the prologue. The mstatus restored above carries FS=3 for
+     * every frame that has FP slots, so these loads do not trap. */
+    FPLOAD f0,  ( 0 * FPREG_BYTES)(sp)
+    FPLOAD f1,  ( 1 * FPREG_BYTES)(sp)
+    FPLOAD f2,  ( 2 * FPREG_BYTES)(sp)
+    FPLOAD f3,  ( 3 * FPREG_BYTES)(sp)
+    FPLOAD f4,  ( 4 * FPREG_BYTES)(sp)
+    FPLOAD f5,  ( 5 * FPREG_BYTES)(sp)
+    FPLOAD f6,  ( 6 * FPREG_BYTES)(sp)
+    FPLOAD f7,  ( 7 * FPREG_BYTES)(sp)
+    FPLOAD f8,  ( 8 * FPREG_BYTES)(sp)
+    FPLOAD f9,  ( 9 * FPREG_BYTES)(sp)
+    FPLOAD f10, (10 * FPREG_BYTES)(sp)
+    FPLOAD f11, (11 * FPREG_BYTES)(sp)
+    FPLOAD f12, (12 * FPREG_BYTES)(sp)
+    FPLOAD f13, (13 * FPREG_BYTES)(sp)
+    FPLOAD f14, (14 * FPREG_BYTES)(sp)
+    FPLOAD f15, (15 * FPREG_BYTES)(sp)
+    FPLOAD f16, (16 * FPREG_BYTES)(sp)
+    FPLOAD f17, (17 * FPREG_BYTES)(sp)
+    FPLOAD f18, (18 * FPREG_BYTES)(sp)
+    FPLOAD f19, (19 * FPREG_BYTES)(sp)
+    FPLOAD f20, (20 * FPREG_BYTES)(sp)
+    FPLOAD f21, (21 * FPREG_BYTES)(sp)
+    FPLOAD f22, (22 * FPREG_BYTES)(sp)
+    FPLOAD f23, (23 * FPREG_BYTES)(sp)
+    FPLOAD f24, (24 * FPREG_BYTES)(sp)
+    FPLOAD f25, (25 * FPREG_BYTES)(sp)
+    FPLOAD f26, (26 * FPREG_BYTES)(sp)
+    FPLOAD f27, (27 * FPREG_BYTES)(sp)
+    FPLOAD f28, (28 * FPREG_BYTES)(sp)
+    FPLOAD f29, (29 * FPREG_BYTES)(sp)
+    FPLOAD f30, (30 * FPREG_BYTES)(sp)
+    FPLOAD f31, (31 * FPREG_BYTES)(sp)
+    addi  sp, sp, 32 * FPREG_BYTES
+#endif
+
     mret
     .size  _interrupt_handler, .-_interrupt_handler
 
