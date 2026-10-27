@@ -37,6 +37,19 @@
 #define FT_TLS_SLOTS        (CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS * 2)
 #define FT_TLS_THREADS      16
 
+static void ft_task_exit_hook(struct rt_thread *thread);
+
+/*
+ * The lowest RT-Thread priority band (RT_THREAD_PRIORITY_MAX - 1) belongs to the
+ * idle thread, and only to it. Mapping a FreeRTOS task there would put it in
+ * idle's band, where RT-Thread 5.x rotates equal priorities by timeslice - so a
+ * tskIDLE_PRIORITY task, which in FreeRTOS means "run only when nothing else
+ * can", would take every second tick away from idle. Idle is not decoration:
+ * rt_defunct_execute() runs from it, so it is what frees finished threads and
+ * their stacks.
+ *
+ * So the mapped band stops one short of idle: ft 0 -> MAX-2, ft 24 -> MAX-26.
+ */
 rt_uint8_t ft_prio_to_rt(ft_ubase_t prio)
 {
     if (prio >= FT_MAX_PRIORITIES)
@@ -44,19 +57,32 @@ rt_uint8_t ft_prio_to_rt(ft_ubase_t prio)
         prio = FT_MAX_PRIORITIES - 1;
     }
 
-    /* ft 0  -> RT_THREAD_PRIORITY_MAX - 1 (lowest)
-     * ft 24 -> RT_THREAD_PRIORITY_MAX - 25 (highest of the mapped band) */
-    return (rt_uint8_t)(RT_THREAD_PRIORITY_MAX - 1u - prio);
+    /* ft 0  -> RT_THREAD_PRIORITY_MAX - 2 (lowest assignable band, above idle)
+     * ft 24 -> RT_THREAD_PRIORITY_MAX - 26 (highest of the mapped band) */
+    return (rt_uint8_t)(RT_THREAD_PRIORITY_MAX - 2u - prio);
 }
 
 ft_ubase_t ft_prio_to_ft(rt_uint8_t prio)
 {
-    if (prio >= RT_THREAD_PRIORITY_MAX)
+    /* Anything at or below the mapped floor reports as the lowest FreeRTOS
+     * priority. That includes the idle thread itself, which has no FreeRTOS
+     * equivalent; reporting 0 for it is the least surprising answer. */
+    if (prio >= RT_THREAD_PRIORITY_MAX - 1u)
     {
-        prio = RT_THREAD_PRIORITY_MAX - 1;
+        return 0;
     }
 
-    return (ft_ubase_t)(RT_THREAD_PRIORITY_MAX - 1u - prio);
+    /* Clamp, because RT-Thread has more priority levels above the mapped band
+     * (0..5) than FreeRTOS has total. uxTaskPriorityGet() on one of RT-Thread's
+     * own high-priority threads - the timer thread is priority 0 - would
+     * otherwise return 25..30, past configMAX_PRIORITIES, and callers do index
+     * arrays with that value. */
+    if (prio < RT_THREAD_PRIORITY_MAX - 1u - (FT_MAX_PRIORITIES - 1u))
+    {
+        return FT_MAX_PRIORITIES - 1u;
+    }
+
+    return (ft_ubase_t)(RT_THREAD_PRIORITY_MAX - 2u - prio);
 }
 
 void *ft_task_create(const char *name, void (*entry)(void *), void *param,
@@ -83,6 +109,10 @@ void *ft_task_create(const char *name, void (*entry)(void *), void *param,
         return RT_NULL;
     }
 
+    /* Arm the TLS slot release for the case where the task function returns
+     * instead of calling vTaskDelete(). See ft_task_exit_hook(). */
+    thread->cleanup = ft_task_exit_hook;
+
     if (rt_thread_startup(thread) != RT_EOK)
     {
         rt_thread_delete(thread);
@@ -106,12 +136,62 @@ void ft_task_delay(ft_tick_t ticks)
         return;
     }
 
+    /* portMAX_DELAY means "forever", and it used to reach
+     * rt_thread_mdelay() by luck: 0xFFFFFFFF * 1000 / 1000 stays 0xFFFFFFFF,
+     * the cast to rt_int32_t makes it -1, and rt_tick_from_millisecond()
+     * happens to read a negative argument as RT_WAITING_FOREVER
+     * (src/clock.c:218). That is three coincidences in a row, and the third one
+     * is documented as "not a valid timeout", not as "sleep forever". Spell it
+     * out instead, with the constant RT-Thread defines for exactly this. */
+    if (ticks == FT_MAX_DELAY)
+    {
+        rt_thread_delay(RT_WAITING_FOREVER);
+        return;
+    }
+
     rt_thread_mdelay((rt_int32_t)(((rt_uint64_t)ticks * 1000u) / CONFIG_FREERTOS_HZ));
 }
 
-/* Defined with the TLS table further down; declared here because vTaskDelete
- * has to release the per-slot delete callbacks before the thread disappears. */
+/* Defined with the TLS table further down; declared here because both
+ * vTaskDelete and the exit hook have to release the per-slot callbacks. */
 static void ft_tls_release(rt_thread_t thread);
+
+/*
+ * Release the TLS slot when a task function returns instead of calling
+ * vTaskDelete.
+ *
+ * This is not an edge case. FreeRTOS allows a task function to simply return,
+ * and IDF components do it: esp_event's loop task suspends itself, but a task
+ * that finishes its work returns. RT-Thread handles the return by routing the
+ * thread through _thread_exit() -> rt_thread_defunct_enqueue(), which never
+ * reaches ft_task_delete() - so the slot stayed occupied forever.
+ *
+ * Two consequences, and the second is the dangerous one:
+ *
+ *   1. 16 slots, no reuse. The table fills up and later tasks silently get NULL
+ *      from ft_task_get_tls(), which for esp_event means losing the per-task
+ *      state it hangs off index 0.
+ *
+ *   2. rt_object_delete() frees the thread object (src/defunct.c:133), so the
+ *      address is available for the next rt_thread_create(). ft_tls_lookup()
+ *      compares pointers, so a new thread allocated at the same address
+ *      inherits the dead task's TLS values AND its deletion callbacks. The
+ *      callback then runs with a value that belongs to someone else.
+ *
+ * rt_thread_t::cleanup is the right hook: it is invoked from the reaper
+ * (src/defunct.c:113) after the thread leaves the scheduler but before the
+ * object is freed, so the slot is cleared while the pointer is still unique.
+ * RT-Thread only ever zeroes this field itself, nothing else assigns it.
+ */
+static void ft_task_exit_hook(struct rt_thread *thread)
+{
+    ft_tls_release(thread);
+
+    /* Same lifetime problem, same window: the notification table is keyed by
+     * thread pointer too, and a stale count makes a completion-counter wait
+     * return early. */
+    ft_notify_forget(thread);
+}
 
 void ft_task_delete(void *handle)
 {
@@ -119,8 +199,13 @@ void ft_task_delete(void *handle)
 
     /* FreeRTOS runs the TLSP deletion callbacks from prvDeleteTCB(), i.e. as
      * part of the delete. IDF's esp_event relies on that to free the per-task
-     * state it hangs off index 0. */
+     * state it hangs off index 0.
+     *
+     * Released here as well as from the exit hook: this path runs immediately,
+     * while the hook waits for the idle thread to drain the defunct list. Doing
+     * both is safe - the second call finds no slot and returns. */
     ft_tls_release(thread);
+    ft_notify_forget(thread);
 
     /* RT-Thread 5.x has no public rt_thread_exit(); rt_thread_delete() accepts
      * the calling thread and hands it to the reaper (src/thread.c:614 routes
@@ -175,6 +260,44 @@ struct ft_tls_entry
 
 static struct ft_tls_entry s_tls[FT_TLS_THREADS];
 
+/* How many slots are occupied. Exists for the self test: the release path only
+ * fires when a task function returns or a task is deleted, and neither is
+ * visible any other way without an on-board run. */
+rt_uint32_t ft_tls_slots_used(void)
+{
+    rt_uint32_t used = 0;
+    rt_base_t   level;
+    int         i;
+
+    level = rt_hw_interrupt_disable();
+    for (i = 0; i < FT_TLS_THREADS; i++)
+    {
+        if (s_tls[i].thread != RT_NULL)
+        {
+            used++;
+        }
+    }
+    rt_hw_interrupt_enable(level);
+
+    return used;
+}
+
+/* Reported once, from both TLS writers. A missing slot is not something to
+ * absorb quietly: the value write disappears, and in the with_cb variant the
+ * deletion callback goes with it, so whatever the component allocated is never
+ * freed. */
+static void ft_tls_overflow_report(void)
+{
+    static rt_uint32_t warned;
+
+    if (!warned)
+    {
+        warned = 1;
+        rt_kprintf("freertos-shim: TLS table full (%d threads); TLS writes are "
+                   "being dropped\n", FT_TLS_THREADS);
+    }
+}
+
 static struct ft_tls_entry *ft_tls_lookup(rt_thread_t thread, rt_bool_t create)
 {
     struct ft_tls_entry *free_entry = RT_NULL;
@@ -226,6 +349,13 @@ void ft_task_set_tls(void *handle, ft_ubase_t index, void *value)
     {
         entry->value[index] = value;
     }
+    else
+    {
+        /* Table full, or the thread cannot be represented. Never silent: a TLS
+         * write that vanishes is only noticed much later, as component state
+         * that reads back as NULL. */
+        ft_tls_overflow_report();
+    }
     rt_hw_interrupt_enable(level);
 }
 
@@ -247,6 +377,12 @@ void ft_task_set_tls_with_cb(void *handle, ft_ubase_t index, void *value,
     {
         entry->value[index] = value;
         entry->cb[index]    = cb;
+    }
+    else
+    {
+        /* Worse than the plain set failing: the deletion callback is how the
+         * component frees what value points at, so dropping it here leaks. */
+        ft_tls_overflow_report();
     }
     rt_hw_interrupt_enable(level);
 }

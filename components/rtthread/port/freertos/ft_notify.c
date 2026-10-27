@@ -39,6 +39,50 @@ struct ft_notify
 static struct ft_notify s_notify[FT_NOTIFY_TASKS];
 static rt_bool_t        s_notify_ready;
 
+/*
+ * Drop a thread's notification slot.
+ *
+ * The table has the same lifetime problem as the TLS one: entries are created on
+ * demand and keyed by rt_thread_t, and nothing released them. The slot is not
+ * just wasted table space - rt_object_delete() frees the thread object
+ * (src/defunct.c:133) and the address is reused by the next rt_thread_create(),
+ * so a new thread can inherit a dead thread's pending count. For a task that
+ * uses xTaskNotifyGive/ulTaskNotifyTake as a completion counter, inheriting a
+ * stale count means one wait returns immediately without its work being done.
+ *
+ * Called from ft_task.c's exit hook, before the object is freed, which is the
+ * only window where the pointer is still unique.
+ */
+void ft_notify_forget(rt_thread_t thread)
+{
+    int i;
+    rt_base_t level;
+
+    if (thread == RT_NULL || !s_notify_ready)
+    {
+        return;
+    }
+
+    level = rt_hw_interrupt_disable();
+    for (i = 0; i < FT_NOTIFY_TASKS; i++)
+    {
+        if (s_notify[i].thread == thread)
+        {
+            s_notify[i].value  = 0;
+            s_notify[i].thread = RT_NULL;
+
+            /* Reset the count. The semaphore object itself stays initialised -
+             * rt_sem_detach() would free the internal ipc object, and this slot
+             * is meant to be reusable without re-initialising. Writers go
+             * through ft_notify_lookup() which clears the value but not the
+             * count, so clear it here where it is still safe. */
+            s_notify[i].sem.value = 0;
+            break;
+        }
+    }
+    rt_hw_interrupt_enable(level);
+}
+
 /* Called with interrupts disabled by every caller. */
 static struct ft_notify *ft_notify_lookup(rt_thread_t thread, rt_bool_t create)
 {

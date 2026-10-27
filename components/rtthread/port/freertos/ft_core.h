@@ -276,12 +276,16 @@ void *ft_task_get_tls(void *handle, ft_ubase_t index);
  * state off a task and have it released with the task. esp_event uses it for the
  * event loop's per-task bookkeeping; pthread_local_storage.c uses it too.
  *
- * The callback runs from ft_task_delete() before the thread object goes away.
+ * The callback runs from ft_task_delete() and from the thread exit hook, in
+ * both cases before the thread object goes away.
  */
 typedef void (*ft_tls_del_cb_t)(int index, void *value);
 
 void ft_task_set_tls_with_cb(void *handle, ft_ubase_t index, void *value,
                              ft_tls_del_cb_t cb);
+
+/** Occupied slots. For the self test: the release path is otherwise invisible. */
+rt_uint32_t ft_tls_slots_used(void);
 
 /* ------------------------------------------------------- task notification -- */
 
@@ -339,6 +343,15 @@ rt_uint32_t ft_task_notify_peek(void *handle);
  * @return the count before the take
  */
 rt_uint32_t ft_task_notify_take(ft_base_t clear_on_exit, ft_tick_t ticks);
+
+/**
+ * Drop a thread's notification slot.
+ *
+ * Must be called before the thread object is freed, because the slot is keyed
+ * by the thread pointer and rt_thread_create() reuses addresses. ft_task.c's
+ * exit hook does this.
+ */
+void ft_notify_forget(rt_thread_t thread);
 
 /* ------------------------------------------------------------- timeouts -- */
 

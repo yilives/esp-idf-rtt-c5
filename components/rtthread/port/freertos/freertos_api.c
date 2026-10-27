@@ -109,7 +109,21 @@ BaseType_t xQueueGenericSend(QueueHandle_t xQueue,
                              TickType_t xTicksToWait,
                              const BaseType_t xCopyPosition)
 {
-    RT_UNUSED(xCopyPosition);   /* both positions are "append" for us */
+    /* Only queueSEND_TO_BACK is implemented: the ring in ft_ipc only ever
+     * appends. queueSEND_TO_FRONT and queueOVERWRITE are not linked into this
+     * image (xQueueSendToFront, xQueueOverwrite and xQueueSendToBack all have
+     * zero references in the map), but staying silent about the difference
+     * would turn a future caller's wrong assumption into a data-ordering bug
+     * with no trace. Say so once instead. */
+    if (xCopyPosition != 0)
+    {
+        static rt_uint32_t warned;
+
+        ft_warn_once(&warned,
+                     "xQueueGenericSend: only queueSEND_TO_BACK is supported, "
+                     "the item was appended");
+    }
+
     return ft_result(ft_ipc_send((struct ft_ipc *)xQueue, pvItemToQueue, xTicksToWait));
 }
 
@@ -118,7 +132,15 @@ BaseType_t xQueueGenericSendFromISR(QueueHandle_t xQueue,
                                     BaseType_t *const pxHigherPriorityTaskWoken,
                                     const BaseType_t xCopyPosition)
 {
-    RT_UNUSED(xCopyPosition);
+    if (xCopyPosition != 0)
+    {
+        static rt_uint32_t warned;
+
+        ft_warn_once(&warned,
+                     "xQueueGenericSendFromISR: only queueSEND_TO_BACK is "
+                     "supported, the item was appended");
+    }
+
     return ft_result(ft_ipc_send_isr((struct ft_ipc *)xQueue, pvItemToQueue,
                                      (ft_base_t *)pxHigherPriorityTaskWoken));
 }

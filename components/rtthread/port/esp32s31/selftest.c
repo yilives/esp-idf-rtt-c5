@@ -884,6 +884,21 @@ struct st_shim_msg
 static struct ft_ipc *s_shim_queue;
 static rt_uint32_t    s_shim_produced;
 
+/* Takes a TLS slot and a notification, then returns from the task function.
+ * Nothing calls ft_task_delete() on this task, which is the point: it exercises
+ * the cleanup path that only the reaper reaches. */
+static void st_tls_exit_task(void *arg)
+{
+    rt_uint32_t marker = 0xC3C3u;
+
+    RT_UNUSED(arg);
+
+    ft_task_set_tls(RT_NULL, 0, &marker);
+    ft_task_notify(RT_NULL, 1, FT_NOTIFY_INCREMENT);
+
+    /* Returning here, not vTaskDelete(). */
+}
+
 static void st_shim_producer(void *arg)
 {
     struct st_shim_msg m;
@@ -1214,6 +1229,46 @@ static int st_fbshim(void)
 
     total_bad += bad;
     st_report("fbshim/tls", bad == 0, "per-thread slots, untouched reads NULL (%d bad)", bad);
+
+    /* ---- 6b. TLS and notify slots are released when a task function returns ----
+     *
+     * This is the one that would otherwise only show up on a long-running board.
+     * Both tables are keyed by rt_thread_t and rt_object_delete() frees the
+     * thread object, so a leaked slot does not just waste a row - the next
+     * thread created at the same address inherits it.
+     *
+     * A task that simply returns exercises exactly the path ft_task_delete()
+     * does not cover: RT-Thread routes the return through _thread_exit() ->
+     * rt_thread_defunct_enqueue(), and the release has to happen in the cleanup
+     * hook while the pointer is still unique.
+     */
+    bad = 0;
+    {
+        rt_uint32_t slots_before;
+
+        slots_before = ft_tls_slots_used();
+
+        /* A task that takes a TLS slot and a notification, then returns. */
+        if (ft_task_create("stexit", st_tls_exit_task, RT_NULL, 512, 12, RT_NULL) == RT_NULL)
+        {
+            bad++;
+        }
+        else
+        {
+            /* Wait for it to have run and returned. The idle thread drains the
+             * defunct list, so the release lands a little after the return. */
+            rt_thread_mdelay(60);
+
+            if (ft_tls_slots_used() != slots_before)
+            {
+                bad++;
+            }
+        }
+    }
+
+    total_bad += bad;
+    st_report("fbshim/exit", bad == 0,
+              "TLS slot freed when the task returns (%d bad)", bad);
 
     /* ---- 7. blocking with the scheduler locked is refused, not hung ---- */
     bad = 0;
