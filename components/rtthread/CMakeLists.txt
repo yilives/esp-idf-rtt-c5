@@ -146,7 +146,8 @@ elseif(CONFIG_IDF_TARGET_ESP32S31)
         "port/esp32s31/cpuport.c"
         "port/esp32s31/interrupt.c"
         "port/esp32s31/serial.c"
-        "port/esp32s31/gpio.c")
+        "port/esp32s31/gpio.c"
+        "port/esp32s31/selftest.c")
     set(rtt_config_dir "${CMAKE_CURRENT_LIST_DIR}/port/esp32s31")
 endif()
 
@@ -166,6 +167,14 @@ set_source_files_properties(${finsh_srcs} ${serial_srcs} PROPERTIES
     COMPILE_OPTIONS "-ffreestanding;-fno-builtin;-Wno-cast-function-type")
 
 set(srcs ${kernel_srcs} ${common_srcs} ${target_srcs} ${finsh_srcs} ${serial_srcs} "port/common/board.c")
+
+if(CONFIG_IDF_TARGET_ESP32S31)
+    # The self test exports an msh command through MSH_CMD_EXPORT_ALIAS, which
+    # hits the same cast-function-type warning as finsh itself.
+    set_source_files_properties("port/esp32s31/selftest.c" PROPERTIES
+        COMPILE_DEFINITIONS "__RTTHREAD__;__RT_KERNEL_SOURCE__"
+        COMPILE_OPTIONS "-ffreestanding;-fno-builtin;-Wno-cast-function-type")
+endif()
 
 idf_component_register(SRCS ${srcs}
     # Upstream headers first, then this component's per-target config directory
