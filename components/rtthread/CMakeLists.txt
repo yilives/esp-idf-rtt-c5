@@ -148,6 +148,7 @@ elseif(CONFIG_IDF_TARGET_ESP32S31)
         "port/esp32s31/interrupt.c"
         "port/esp32s31/serial.c"
         "port/esp32s31/gpio.c"
+        "port/esp32s31/boot_tasks.c"
         "port/esp32s31/pwm.c"
         "port/esp32s31/gptimer.c"
         "port/esp32s31/selftest.c")
@@ -205,7 +206,7 @@ idf_component_register(SRCS ${srcs}
                  "${RTTHREAD_ROOT}/components/drivers/include" "${rtt_config_dir}"
     PRIV_INCLUDE_DIRS "${rtt_riscv_port_dir}" "${IDF_PATH}/components/freertos"
                       "${CMAKE_CURRENT_LIST_DIR}/port/freertos"
-    PRIV_REQUIRES freertos riscv esp_rom soc hal esp_hal_uart esp_hal_gpio
+    PRIV_REQUIRES freertos riscv esp_rom soc hal esp_hal_uart esp_hal_gpio heap
     LDFRAGMENTS "linker.lf")
 
 # IDF applies these properties via generator expressions, including to components
