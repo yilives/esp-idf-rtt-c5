@@ -235,3 +235,33 @@ void *ft_task_get_tls(void *handle, ft_ubase_t index)
 
     return value;
 }
+
+ft_tick_t ft_task_tick_count_isr(void)
+{
+    return (ft_tick_t)rt_tick_get();
+}
+
+ft_base_t ft_task_scheduler_state(void)
+{
+    /* FreeRTOS reports SUSPENDED while vTaskSuspendAll is in effect, and callers
+     * use that to decide whether they may block. rt_critical_level() counts the
+     * same nesting for rt_enter_critical(), so it is the right source. The
+     * NOT_STARTED state is unreachable from a running thread. */
+    return rt_critical_level() ? FT_SCHEDULER_SUSPENDED : FT_SCHEDULER_RUNNING;
+}
+
+void ft_task_suspend_all(void)
+{
+    rt_enter_critical();
+}
+
+ft_base_t ft_task_resume_all(void)
+{
+    rt_exit_critical();
+
+    /* FreeRTOS returns pdTRUE when a switch is pending so the caller can
+     * yield immediately. RT-Thread's exit already reschedules when needed, so
+     * the value is only a hint; answering "yes" costs at most one extra
+     * scheduler pass and never delays a waiting task. */
+    return ftPASS;
+}

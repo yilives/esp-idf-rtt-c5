@@ -23,7 +23,8 @@ enum ft_ipc_kind
 {
     FT_IPC_KIND_QUEUE = 1,
     FT_IPC_KIND_SEM,
-    FT_IPC_KIND_MUTEX,
+    FT_IPC_KIND_MUTEX,      /* non-recursive, like xSemaphoreCreateMutex */
+    FT_IPC_KIND_RECMUTEX,   /* recursive, like xSemaphoreCreateRecursiveMutex */
 };
 
 struct ft_ipc
@@ -41,7 +42,13 @@ struct ft_ipc
     struct rt_semaphore available;
     struct rt_semaphore free_slots;
 
-    struct rt_mutex mutex;      /* FT_IPC_KIND_MUTEX only */
+    struct rt_mutex mutex;      /* both mutex kinds */
+
+    /* RT-Thread mutexes are recursive by nature: rt_mutex_take by the owner
+     * just bumps hold. FreeRTOS's plain mutex is not, and code relies on that,
+     * so the plain kind is guarded here and only the recursive kind is allowed
+     * to use rt_mutex's own recursion. */
+    rt_thread_t owner;          /* FT_IPC_KIND_MUTEX only */
 };
 
 /* FreeRTOS ticks to RT-Thread ticks. Both are 1 kHz in this configuration, but
@@ -74,7 +81,7 @@ static struct ft_ipc *ft_ipc_init(struct ft_ipc *q, rt_uint8_t kind,
     q->item_size   = item_size;
     q->length      = length ? (rt_uint32_t)length : 1u;
 
-    if (kind == FT_IPC_KIND_MUTEX)
+    if (kind == FT_IPC_KIND_MUTEX || kind == FT_IPC_KIND_RECMUTEX)
     {
         if (rt_mutex_init(&q->mutex, "ftmtx", RT_IPC_FLAG_PRIO) != RT_EOK)
         {
@@ -175,7 +182,7 @@ struct ft_ipc *ft_ipc_create_sem(ft_ubase_t max_count, ft_ubase_t initial)
     return q;
 }
 
-struct ft_ipc *ft_ipc_create_mutex(void)
+struct ft_ipc *ft_ipc_create_mutex_ex(ft_base_t recursive)
 {
     struct ft_ipc *q = rt_malloc(sizeof(*q));
 
@@ -184,13 +191,39 @@ struct ft_ipc *ft_ipc_create_mutex(void)
         return RT_NULL;
     }
 
-    if (ft_ipc_init(q, FT_IPC_KIND_MUTEX, 1, 0, RT_NULL, RT_TRUE) == RT_NULL)
+    if (ft_ipc_init(q, recursive ? FT_IPC_KIND_RECMUTEX : FT_IPC_KIND_MUTEX,
+                    1, 0, RT_NULL, RT_TRUE) == RT_NULL)
     {
         rt_free(q);
         return RT_NULL;
     }
 
     return q;
+}
+
+struct ft_ipc *ft_ipc_create_mutex(void)
+{
+    return ft_ipc_create_mutex_ex(0);
+}
+
+void *ft_ipc_mutex_holder(struct ft_ipc *ipc)
+{
+    if (ipc == RT_NULL)
+    {
+        return RT_NULL;
+    }
+
+    if (ipc->kind == FT_IPC_KIND_MUTEX)
+    {
+        return ipc->owner;
+    }
+
+    if (ipc->kind == FT_IPC_KIND_RECMUTEX)
+    {
+        return ipc->mutex.owner;
+    }
+
+    return RT_NULL;
 }
 
 void ft_ipc_delete(struct ft_ipc *ipc)
@@ -200,7 +233,7 @@ void ft_ipc_delete(struct ft_ipc *ipc)
         return;
     }
 
-    if (ipc->kind == FT_IPC_KIND_MUTEX)
+    if (ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX)
     {
         rt_mutex_detach(&ipc->mutex);
     }
@@ -264,7 +297,7 @@ int ft_ipc_send(struct ft_ipc *ipc, const void *item, ft_tick_t ticks)
         return FT_ERR_PARAM;
     }
 
-    if (ipc->kind == FT_IPC_KIND_MUTEX)
+    if (ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX)
     {
         return ft_ipc_give(ipc);
     }
@@ -292,7 +325,7 @@ int ft_ipc_send_isr(struct ft_ipc *ipc, const void *item, ft_base_t *woken)
         return FT_ERR_PARAM;
     }
 
-    if (ipc->kind == FT_IPC_KIND_MUTEX)
+    if (ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX)
     {
         return ft_ipc_give_isr(ipc, woken);
     }
@@ -332,7 +365,8 @@ static int ft_ipc_take_item(struct ft_ipc *ipc, void *item, ft_tick_t ticks)
 
 int ft_ipc_receive(struct ft_ipc *ipc, void *item, ft_tick_t ticks)
 {
-    if (ipc == RT_NULL || ipc->kind == FT_IPC_KIND_MUTEX)
+    if (ipc == RT_NULL ||
+        ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX)
     {
         return FT_ERR_PARAM;
     }
@@ -347,7 +381,8 @@ int ft_ipc_receive_isr(struct ft_ipc *ipc, void *item, ft_base_t *woken)
         *woken = ftFAIL;
     }
 
-    if (ipc == RT_NULL || ipc->kind == FT_IPC_KIND_MUTEX)
+    if (ipc == RT_NULL ||
+        ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX)
     {
         return FT_ERR_PARAM;
     }
@@ -375,10 +410,30 @@ int ft_ipc_take(struct ft_ipc *ipc, ft_tick_t ticks)
         return FT_ERR_PARAM;
     }
 
-    if (ipc->kind == FT_IPC_KIND_MUTEX)
+    if (ipc->kind == FT_IPC_KIND_RECMUTEX)
     {
+        /* rt_mutex_take already lets the owner take it again. */
         return (rt_mutex_take(&ipc->mutex, ft_ticks_to_rt(ticks)) == RT_EOK)
                ? FT_OK : FT_ERR_TIMEOUT;
+    }
+
+    if (ipc->kind == FT_IPC_KIND_MUTEX)
+    {
+        rt_thread_t self = rt_thread_self();
+
+        /* FreeRTOS would deadlock here; failing is the only useful answer. */
+        if (ipc->owner == self)
+        {
+            return FT_ERR_TIMEOUT;
+        }
+
+        if (rt_mutex_take(&ipc->mutex, ft_ticks_to_rt(ticks)) != RT_EOK)
+        {
+            return FT_ERR_TIMEOUT;
+        }
+
+        ipc->owner = self;
+        return FT_OK;
     }
 
     return ft_ipc_take_item(ipc, RT_NULL, ticks);
@@ -391,9 +446,25 @@ int ft_ipc_give(struct ft_ipc *ipc)
         return FT_ERR_PARAM;
     }
 
-    if (ipc->kind == FT_IPC_KIND_MUTEX)
+    if (ipc->kind == FT_IPC_KIND_RECMUTEX)
     {
         return (rt_mutex_release(&ipc->mutex) == RT_EOK) ? FT_OK : FT_ERR_STATE;
+    }
+
+    if (ipc->kind == FT_IPC_KIND_MUTEX)
+    {
+        if (ipc->owner != rt_thread_self())
+        {
+            return FT_ERR_STATE;    /* only the owner may release */
+        }
+
+        if (rt_mutex_release(&ipc->mutex) != RT_EOK)
+        {
+            return FT_ERR_STATE;
+        }
+
+        ipc->owner = RT_NULL;
+        return FT_OK;
     }
 
     return ft_ipc_send(ipc, RT_NULL, FT_NO_WAIT);
@@ -401,7 +472,8 @@ int ft_ipc_give(struct ft_ipc *ipc)
 
 int ft_ipc_give_isr(struct ft_ipc *ipc, ft_base_t *woken)
 {
-    if (ipc != RT_NULL && ipc->kind == FT_IPC_KIND_MUTEX)
+    if (ipc != RT_NULL &&
+        (ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX))
     {
         /* A mutex cannot be released from an ISR in FreeRTOS either. */
         if (woken != RT_NULL)
@@ -426,7 +498,8 @@ ft_base_t ft_ipc_is_empty(struct ft_ipc *ipc)
 
 ft_ubase_t ft_ipc_messages_waiting(struct ft_ipc *ipc)
 {
-    if (ipc == RT_NULL || ipc->kind == FT_IPC_KIND_MUTEX)
+    if (ipc == RT_NULL ||
+        ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX)
     {
         return 0;
     }
@@ -436,7 +509,8 @@ ft_ubase_t ft_ipc_messages_waiting(struct ft_ipc *ipc)
 
 ft_ubase_t ft_ipc_spaces_available(struct ft_ipc *ipc)
 {
-    if (ipc == RT_NULL || ipc->kind == FT_IPC_KIND_MUTEX)
+    if (ipc == RT_NULL ||
+        ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX)
     {
         return 0;
     }

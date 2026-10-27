@@ -1085,11 +1085,63 @@ static int st_fbshim(void)
         {
             bad++;
         }
+
+        /* the owner must be visible while held, and cleared after release */
+        if (ft_ipc_mutex_holder(mtx) != ft_task_self())
+        {
+            bad++;
+        }
         ft_ipc_give(mtx);
+        if (ft_ipc_mutex_holder(mtx) != RT_NULL)
+        {
+            bad++;
+        }
+    }
+
+    /* recursive mutex: the owner must be able to take it again */
+    {
+        struct ft_ipc *rmtx = ft_ipc_create_mutex_ex(1);
+
+        if (rmtx == RT_NULL)
+        {
+            bad++;
+        }
+        else
+        {
+            if (ft_ipc_take(rmtx, FT_NO_WAIT) != FT_OK ||
+                ft_ipc_take(rmtx, FT_NO_WAIT) != FT_OK ||
+                ft_ipc_give(rmtx) != FT_OK ||
+                ft_ipc_give(rmtx) != FT_OK ||
+                ft_ipc_take(rmtx, FT_NO_WAIT) != FT_OK)
+            {
+                bad++;
+            }
+            ft_ipc_give(rmtx);
+            ft_ipc_delete(rmtx);
+        }
+    }
+
+    /* scheduler lock: state must read SUSPENDED inside, RUNNING outside */
+    {
+        if (ft_task_scheduler_state() != FT_SCHEDULER_RUNNING)
+        {
+            bad++;
+        }
+        ft_task_suspend_all();
+        if (ft_task_scheduler_state() != FT_SCHEDULER_SUSPENDED)
+        {
+            bad++;
+        }
+        ft_task_resume_all();
+        if (ft_task_scheduler_state() != FT_SCHEDULER_RUNNING)
+        {
+            bad++;
+        }
     }
 
     total_bad += bad;
-    st_report("fbshim/sem", bad == 0, "counting 3 max, mutex not recursive (%d bad)", bad);
+    st_report("fbshim/sem", bad == 0,
+              "counting 3 max, mutex not recursive, recursive ok, sched lock (%d bad)", bad);
 
     /* ---- 5. event group ---- */
     bad = 0;

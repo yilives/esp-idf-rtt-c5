@@ -88,8 +88,19 @@ rt_size_t ft_ipc_size(void);
 /** Binary (max 1, initial 0) or counting semaphore. */
 struct ft_ipc *ft_ipc_create_sem(ft_ubase_t max_count, ft_ubase_t initial);
 
-/** Mutex with priority inheritance. */
+/** Mutex with priority inheritance. Not recursive, like xSemaphoreCreateMutex. */
 struct ft_ipc *ft_ipc_create_mutex(void);
+
+/**
+ * Mutex, recursive or not.
+ *
+ * @param recursive 0 for xSemaphoreCreateMutex semantics (a second take by the
+ *                  owner fails), 1 for xSemaphoreCreateRecursiveMutex
+ */
+struct ft_ipc *ft_ipc_create_mutex_ex(ft_base_t recursive);
+
+/** Thread currently holding a mutex, or NULL. Used by xQueueGetMutexHolder. */
+void *ft_ipc_mutex_holder(struct ft_ipc *ipc);
 
 void ft_ipc_delete(struct ft_ipc *ipc);
 
@@ -175,6 +186,28 @@ ft_ubase_t  ft_task_get_priority(void *handle);
 
 void      *ft_task_self(void);
 ft_tick_t  ft_task_tick_count(void);
+
+/** Same value; FreeRTOS distinguishes the two only by which context may call. */
+ft_tick_t  ft_task_tick_count_isr(void);
+
+/* Scheduler states, matching eSchedulerState in task.h. */
+#define FT_SCHEDULER_SUSPENDED      0
+#define FT_SCHEDULER_NOT_STARTED    1
+#define FT_SCHEDULER_RUNNING        2
+
+/**
+ * xTaskGetSchedulerState().
+ *
+ * RT-Thread has no "not started" state visible from a running thread, so the
+ * answer is RUNNING unless the scheduler is locked, which is the case that
+ * callers actually branch on (spi_flash and newlib's lock layer use it to
+ * decide whether blocking is legal).
+ */
+ft_base_t ft_task_scheduler_state(void);
+
+/** vTaskSuspendAll / xTaskResumeAll, mapped to the RT-Thread scheduler lock. */
+void      ft_task_suspend_all(void);
+ft_base_t ft_task_resume_all(void);
 
 void ft_task_set_tls(void *handle, ft_ubase_t index, void *value);
 void *ft_task_get_tls(void *handle, ft_ubase_t index);
