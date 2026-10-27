@@ -514,10 +514,24 @@ static int st_fpu(void)
 /* ------------------------------------------------------------------- irq -- */
 
 static volatile rt_uint32_t s_irq_count;
+static volatile rt_uint32_t s_irq_nest_bad;
+static volatile rt_uint32_t s_irq_nest_seen;
 
 static void st_irq_cb(void *args)
 {
+    /* The handler must run with exactly one level of interrupt nesting: the
+     * trap entry raises it, the trap exit lowers it. Anything else means the
+     * RT-Thread enter/leave pairing does not match the hardware frame. */
+    rt_uint32_t nest = (rt_uint32_t)rt_interrupt_get_nest();
+
     RT_UNUSED(args);
+
+    s_irq_nest_seen = nest;
+    if (nest != 1)
+    {
+        s_irq_nest_bad++;
+    }
+
     s_irq_count++;
 }
 
@@ -546,7 +560,9 @@ static int st_irq(rt_base_t pin)
         return ST_FAIL;
     }
 
-    s_irq_count = 0;
+    s_irq_count     = 0;
+    s_irq_nest_bad  = 0;
+    s_irq_nest_seen = 0;
 
     rt_pin_mode(pin, PIN_MODE_INPUT);
     if (rt_pin_attach_irq(pin, PIN_IRQ_MODE_RISING, st_irq_cb, RT_NULL) != RT_EOK)
@@ -566,8 +582,9 @@ static int st_irq(rt_base_t pin)
     rt_pin_irq_enable(pin, PIN_IRQ_DISABLE);
     rt_pin_detach_irq(pin);
 
-    ok = (s_irq_count == N);
-    st_report("irq", ok, "pin %d: %u/%d interrupts delivered", (int)pin, s_irq_count, N);
+    ok = (s_irq_count == N) && (s_irq_nest_bad == 0);
+    st_report("irq", ok, "pin %d: %u/%d interrupts, nest=%u (%u bad)",
+              (int)pin, s_irq_count, N, s_irq_nest_seen, s_irq_nest_bad);
 
     return ok ? ST_PASS : ST_FAIL;
 }
