@@ -72,6 +72,17 @@ typedef rt_uint32_t     ft_tick_t;
  * RT_WAITING_FOREVER. Defined once in ft_ipc.c. */
 rt_int32_t ft_ticks_to_rt(ft_tick_t ticks);
 
+/**
+ * Whether a blocking call with this timeout can work at all.
+ *
+ * False when the caller is in an ISR, or when the RT-Thread scheduler is locked
+ * (which is what an IDF portENTER_CRITICAL leaves behind). Blocking there is
+ * guaranteed to strand the caller: rt_schedule() is a no-op while the scheduler
+ * lock is held, so the thread leaves the ready queue and is never resumed.
+ * Every blocking entry point checks this and returns FT_ERR_STATE instead.
+ */
+rt_bool_t ft_block_allowed(ft_tick_t ticks, const char *what);
+
 /* ------------------------------------------------------------------ queue -- */
 
 struct ft_ipc;
@@ -93,6 +104,38 @@ struct ft_ipc *ft_ipc_create(ft_ubase_t length, ft_ubase_t item_size);
  */
 struct ft_ipc *ft_ipc_create_static(ft_ubase_t length, ft_ubase_t item_size,
                                     void *storage, void *cb, ft_ubase_t cb_size);
+
+/**
+ * Use the caller's storage and control block, but keep the object itself on
+ * the RT-Thread heap.
+ *
+ * This exists because of xQueueCreateWithCaps(): idf_additions.c allocates a
+ * FreeRTOS StaticQueue_t, which is a Queue_t-sized union - far smaller than
+ * struct ft_ipc. Placing the object in it would overflow. Instead the caller's
+ * storage becomes the ring buffer, its control block is remembered verbatim so
+ * xQueueGetStaticBuffers() can hand it back for the caller to free, and the
+ * object itself is heap allocated.
+ *
+ * Deletion frees only the object; the two caller buffers stay the caller's
+ * property, which is exactly what vQueueDeleteWithCaps expects.
+ */
+struct ft_ipc *ft_ipc_create_static_ram(ft_ubase_t length, ft_ubase_t item_size,
+                                        void *storage, void *cb);
+
+/**
+ * Mutex whose caller-supplied control block is only remembered, not used.
+ *
+ * xSemaphoreCreateMutexStatic() passes a StaticQueue_t that is too small for
+ * struct ft_ipc, and a mutex has no storage area to borrow, so the object goes
+ * on the heap and the caller's block is kept for xQueueGetStaticBuffers().
+ */
+struct ft_ipc *ft_ipc_create_mutex_static(void *cb, ft_base_t recursive);
+
+/** The control block passed to ft_ipc_create_static_ram(), or NULL. */
+void *ft_ipc_static_cb(struct ft_ipc *ipc);
+
+/** The ring buffer this object writes into, for xQueueGenericGetStaticBuffers(). */
+void *ft_ipc_storage(struct ft_ipc *ipc);
 
 /** Size a caller must provide to ft_ipc_create_static(). */
 rt_size_t ft_ipc_size(void);
@@ -224,6 +267,79 @@ ft_base_t ft_task_resume_all(void);
 
 void ft_task_set_tls(void *handle, ft_ubase_t index, void *value);
 void *ft_task_get_tls(void *handle, ft_ubase_t index);
+
+/* ------------------------------------------------------- task notification -- */
+
+/*
+ * Task notifications, used as a per-task binary/counting wakeup with an
+ * optional bit payload.
+ *
+ * Why it matters: stream_buffer.c (which esp_driver_uart reaches through
+ * esp_ringbuf) does its whole blocking protocol with
+ * xTaskNotify(eNoAction) + xTaskNotifyWait, and esp_timer/esp_eth/esp_ipc use
+ * ulTaskNotifyTake. Without these, neither stream buffers nor timers can block.
+ *
+ * The value semantics below cover eNoAction, eSetBits, eIncrement and both
+ * eSetValue forms. eSetValueWithoutOverwrite returns FT_ERR_STATE when a
+ * notification is still pending, which is what FreeRTOS reports as pdFAIL.
+ */
+
+#define FT_NOTIFY_NO_ACTION             0
+#define FT_NOTIFY_SET_BITS              1
+#define FT_NOTIFY_INCREMENT             2
+#define FT_NOTIFY_SET_VALUE_OVERWRITE   3
+#define FT_NOTIFY_SET_VALUE_NO_OVERWRITE 4
+
+/** xTaskNotify(). Returns FT_OK or FT_ERR_STATE. */
+int ft_task_notify(void *handle, rt_uint32_t value, ft_base_t action);
+
+/** xTaskNotifyFromISR(). @p woken set to 1 if a task was made ready. */
+int ft_task_notify_isr(void *handle, rt_uint32_t value, ft_base_t action,
+                       ft_base_t *woken);
+
+/**
+ * xTaskNotifyWait().
+ *
+ * @param clear_on_entry clear the value before blocking
+ * @param clear_on_exit  clear the value being returned
+ * @param timed_out      optional; set to 1 when the wait expired
+ * @return the notification value (0 when @p clear_on_entry cleared it and
+ *         nothing new arrived, matching FreeRTOS)
+ */
+rt_uint32_t ft_task_notify_wait(rt_uint32_t clear_on_entry,
+                                rt_uint32_t clear_on_exit,
+                                ft_tick_t ticks, ft_base_t *timed_out);
+
+/** xTaskNotifyStateClear(). Returns the value that was pending. */
+rt_uint32_t ft_task_notify_clear(void *handle);
+
+/** Current notification value without changing it (xTaskNotify's out param). */
+rt_uint32_t ft_task_notify_peek(void *handle);
+
+/**
+ * ulTaskNotifyTake().
+ *
+ * @param clear_on_exit pdTRUE for binary semantics (reset the count to 0 and
+ *                      return what was there), pdFALSE to decrement by one
+ * @return the count before the take
+ */
+rt_uint32_t ft_task_notify_take(ft_base_t clear_on_exit, ft_tick_t ticks);
+
+/* ------------------------------------------------------------- timeouts -- */
+
+/*
+ * Mirrors TimeOut_t, field for field, so freertos_api.c can cast between them.
+ * BaseType_t is long and TickType_t is uint32_t on this port, which is what
+ * ft_base_t and ft_tick_t are.
+ */
+typedef struct
+{
+    ft_base_t xOverflowCount;
+    ft_tick_t xTimeOnEntering;
+} ft_timeout_t;
+
+void      ft_timeout_set(ft_timeout_t *timeout);
+ft_base_t ft_timeout_check(ft_timeout_t *timeout, ft_tick_t *remaining);
 
 #ifdef __cplusplus
 }

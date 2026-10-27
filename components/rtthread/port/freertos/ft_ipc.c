@@ -49,6 +49,12 @@ struct ft_ipc
      * so the plain kind is guarded here and only the recursive kind is allowed
      * to use rt_mutex's own recursion. */
     rt_thread_t owner;          /* FT_IPC_KIND_MUTEX only */
+
+    /* Set when the object was heap allocated by ft_ipc_create_static_ram()
+     * because the caller's control block (a FreeRTOS StaticQueue_t) is too
+     * small to hold struct ft_ipc. Kept so xQueueGetStaticBuffers() can hand
+     * the caller's own block back for it to free. */
+    void       *static_cb;
 };
 
 /* FreeRTOS ticks to RT-Thread ticks. Both are 1 kHz in this configuration, but
@@ -67,6 +73,55 @@ rt_int32_t ft_ticks_to_rt(ft_tick_t ticks)
 rt_size_t ft_ipc_size(void)
 {
     return sizeof(struct ft_ipc);
+}
+
+/*
+ * Refuse to block when the RT-Thread scheduler is locked, or from an ISR.
+ *
+ * This is not defensive coding; it turns a hang into an error. rt_schedule()
+ * does nothing at all while rt_scheduler_lock_nest is non-zero
+ * (src/scheduler_up.c:296), so _rt_sem_take() suspends the caller, fails to
+ * switch away, and returns -RT_EINTR while the thread is still on the
+ * semaphore's suspend list (src/ipc.c sets thread->error = RT_EINTR before the
+ * suspend and only the resumer clears it). The caller then keeps running with
+ * its status already set to suspend and its ready-queue entry gone, so the next
+ * reschedule parks it forever with no trace.
+ *
+ * FreeRTOS enforces the same rule with configASSERT in vTaskPlaceOnEventList.
+ * The difference is that an assert stops the board at the call site, which is
+ * what we want here too - but recoverable, because some IDF paths probe for it.
+ */
+rt_bool_t ft_block_allowed(ft_tick_t ticks, const char *what)
+{
+    static rt_uint32_t warned;
+
+    if (ticks == 0)
+    {
+        return RT_TRUE;         /* non-blocking is always legal */
+    }
+
+    if (rt_interrupt_get_nest() != 0)
+    {
+        if (!warned)
+        {
+            warned = 1;
+            rt_kprintf("freertos-shim: %s cannot block in an ISR\n", what);
+        }
+        return RT_FALSE;
+    }
+
+    if (rt_critical_level() != 0)
+    {
+        if (!warned)
+        {
+            warned = 1;
+            rt_kprintf("freertos-shim: %s cannot block with the scheduler locked "
+                       "(an IDF critical section is held)\n", what);
+        }
+        return RT_FALSE;
+    }
+
+    return RT_TRUE;
 }
 
 static struct ft_ipc *ft_ipc_init(struct ft_ipc *q, rt_uint8_t kind,
@@ -160,6 +215,66 @@ struct ft_ipc *ft_ipc_create_static(ft_ubase_t length, ft_ubase_t item_size,
                        length, item_size, (rt_uint8_t *)storage, RT_FALSE);
 }
 
+struct ft_ipc *ft_ipc_create_static_ram(ft_ubase_t length, ft_ubase_t item_size,
+                                        void *storage, void *cb)
+{
+    struct ft_ipc *q;
+
+    if (cb == RT_NULL || length == 0)
+    {
+        return RT_NULL;
+    }
+
+    q = rt_malloc(sizeof(*q));
+    if (q == RT_NULL)
+    {
+        return RT_NULL;
+    }
+
+    if (ft_ipc_init(q, item_size ? FT_IPC_KIND_QUEUE : FT_IPC_KIND_SEM,
+                    length, item_size, (rt_uint8_t *)storage, RT_FALSE) == RT_NULL)
+    {
+        rt_free(q);
+        return RT_NULL;
+    }
+
+    q->static_cb = cb;
+
+    return q;
+}
+
+void *ft_ipc_static_cb(struct ft_ipc *ipc)
+{
+    return (ipc != RT_NULL) ? ipc->static_cb : RT_NULL;
+}
+
+struct ft_ipc *ft_ipc_create_mutex_static(void *cb, ft_base_t recursive)
+{
+    struct ft_ipc *q;
+
+    q = rt_malloc(sizeof(*q));
+    if (q == RT_NULL)
+    {
+        return RT_NULL;
+    }
+
+    if (ft_ipc_init(q, recursive ? FT_IPC_KIND_RECMUTEX : FT_IPC_KIND_MUTEX,
+                    1, 0, RT_NULL, RT_FALSE) == RT_NULL)
+    {
+        rt_free(q);
+        return RT_NULL;
+    }
+
+    q->static_cb = cb;
+
+    return q;
+}
+
+void *ft_ipc_storage(struct ft_ipc *ipc)
+{
+    return (ipc != RT_NULL) ? ipc->buf : RT_NULL;
+}
+
 struct ft_ipc *ft_ipc_create_sem(ft_ubase_t max_count, ft_ubase_t initial)
 {
     struct ft_ipc *q;
@@ -251,6 +366,13 @@ void ft_ipc_delete(struct ft_ipc *ipc)
         }
         rt_free(ipc);
     }
+    else if (ipc->static_cb != RT_NULL)
+    {
+        /* Object is ours, the storage and control block belong to the caller.
+         * vQueueDeleteWithCaps() frees those two itself. */
+        ipc->static_cb = RT_NULL;
+        rt_free(ipc);
+    }
     else
     {
         rt_memset(ipc, 0, sizeof(*ipc));
@@ -302,9 +424,25 @@ int ft_ipc_send(struct ft_ipc *ipc, const void *item, ft_tick_t ticks)
         return ft_ipc_give(ipc);
     }
 
-    if (rt_sem_take(&ipc->free_slots, ft_ticks_to_rt(ticks)) != RT_EOK)
+    /* Try the non-blocking path first. A free slot means this call cannot
+     * block, so it stays legal inside a critical section - FreeRTOS's assert
+     * guards vTaskPlaceOnEventList, i.e. the blocking path only. */
+    if (rt_sem_trytake(&ipc->free_slots) != RT_EOK)
     {
-        return FT_ERR_FULL;
+        if (ticks == 0)
+        {
+            return FT_ERR_FULL;
+        }
+
+        if (!ft_block_allowed(ticks, "xQueueSend"))
+        {
+            return FT_ERR_STATE;
+        }
+
+        if (rt_sem_take(&ipc->free_slots, ft_ticks_to_rt(ticks)) != RT_EOK)
+        {
+            return FT_ERR_FULL;
+        }
     }
 
     ft_ipc_push(ipc, item);
@@ -352,9 +490,22 @@ int ft_ipc_send_isr(struct ft_ipc *ipc, const void *item, ft_base_t *woken)
 
 static int ft_ipc_take_item(struct ft_ipc *ipc, void *item, ft_tick_t ticks)
 {
-    if (rt_sem_take(&ipc->available, ft_ticks_to_rt(ticks)) != RT_EOK)
+    if (rt_sem_trytake(&ipc->available) != RT_EOK)
     {
-        return FT_ERR_TIMEOUT;
+        if (ticks == 0)
+        {
+            return FT_ERR_TIMEOUT;
+        }
+
+        if (!ft_block_allowed(ticks, "xQueueReceive"))
+        {
+            return FT_ERR_STATE;
+        }
+
+        if (rt_sem_take(&ipc->available, ft_ticks_to_rt(ticks)) != RT_EOK)
+        {
+            return FT_ERR_TIMEOUT;
+        }
     }
 
     ft_ipc_pop(ipc, item);
@@ -412,7 +563,23 @@ int ft_ipc_take(struct ft_ipc *ipc, ft_tick_t ticks)
 
     if (ipc->kind == FT_IPC_KIND_RECMUTEX)
     {
-        /* rt_mutex_take already lets the owner take it again. */
+        /* rt_mutex_take already lets the owner take it again, and for the
+         * owner that path never blocks. */
+        if (rt_mutex_trytake(&ipc->mutex) == RT_EOK)
+        {
+            return FT_OK;
+        }
+
+        if (ticks == 0)
+        {
+            return FT_ERR_TIMEOUT;
+        }
+
+        if (!ft_block_allowed(ticks, "xSemaphoreTake"))
+        {
+            return FT_ERR_STATE;
+        }
+
         return (rt_mutex_take(&ipc->mutex, ft_ticks_to_rt(ticks)) == RT_EOK)
                ? FT_OK : FT_ERR_TIMEOUT;
     }
@@ -425,6 +592,22 @@ int ft_ipc_take(struct ft_ipc *ipc, ft_tick_t ticks)
         if (ipc->owner == self)
         {
             return FT_ERR_TIMEOUT;
+        }
+
+        if (rt_mutex_trytake(&ipc->mutex) == RT_EOK)
+        {
+            ipc->owner = self;
+            return FT_OK;
+        }
+
+        if (ticks == 0)
+        {
+            return FT_ERR_TIMEOUT;
+        }
+
+        if (!ft_block_allowed(ticks, "xSemaphoreTake"))
+        {
+            return FT_ERR_STATE;
         }
 
         if (rt_mutex_take(&ipc->mutex, ft_ticks_to_rt(ticks)) != RT_EOK)

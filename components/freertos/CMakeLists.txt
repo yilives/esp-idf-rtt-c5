@@ -86,6 +86,14 @@ if(NOT CONFIG_IDF_RTOS_RTTHREAD_FREERTOS_SHIM)
         "${kernel_impl}/timers.c"
         "${kernel_impl}/event_groups.c"
         "${kernel_impl}/stream_buffer.c")
+else()
+    # stream_buffer.c survives the switch even though queue.c/tasks.c do not.
+    # It is self-contained: no pxCurrentTCBs, no scheduler internals, only the
+    # task notification API (which the shim implements) plus port macros. Keeping
+    # it means xStreamBuffer* and idf_additions' xStreamBufferCreateWithCaps stay
+    # callable instead of becoming undefined symbols the first time something
+    # reaches for them.
+    list(APPEND srcs "${kernel_impl}/stream_buffer.c")
 endif()
 
 # Add port source files

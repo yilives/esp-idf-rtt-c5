@@ -1215,6 +1215,62 @@ static int st_fbshim(void)
     total_bad += bad;
     st_report("fbshim/tls", bad == 0, "per-thread slots, untouched reads NULL (%d bad)", bad);
 
+    /* ---- 7. blocking with the scheduler locked is refused, not hung ---- */
+    bad = 0;
+    {
+        struct st_shim_msg    dummy;
+        struct ft_ipc        *gq;
+        int                   rc;
+
+        gq = ft_ipc_create(1, sizeof(struct st_shim_msg));
+
+        if (gq == RT_NULL)
+        {
+            bad++;
+        }
+        else
+        {
+            /* Empty queue + 10 ticks would block. Inside a critical section that
+             * must come back as FT_ERR_STATE; without the guard rt_sem_take()
+             * would suspend this thread, fail to switch away (rt_schedule() is a
+             * no-op while the lock is held) and leave it off the ready queue. */
+            rt_enter_critical();
+            rc = ft_ipc_receive(gq, &dummy, 10);
+            if (rc != FT_ERR_STATE)
+            {
+                bad++;
+            }
+
+#if CONFIG_IDF_RTOS_RTTHREAD_FREERTOS_SHIM
+            /* ft_notify.c is only built with the shim, and nothing outside the
+             * shim calls notifications, so this half is conditional. */
+            {
+                ft_base_t timed_out = 0;
+
+                (void)ft_task_notify_wait(0, 0, 10, &timed_out);
+                if (!timed_out)
+                {
+                    bad++;
+                }
+            }
+#endif
+
+            /* Non-blocking must still work in the same context: the guard is on
+             * the blocking path only, same as FreeRTOS's assert. */
+            if (ft_ipc_receive(gq, &dummy, 0) != FT_ERR_TIMEOUT)
+            {
+                bad++;
+            }
+            rt_exit_critical();
+
+            ft_ipc_delete(gq);
+        }
+    }
+
+    total_bad += bad;
+    st_report("fbshim/guard", bad == 0,
+              "blocking under the scheduler lock returns an error (%d bad)", bad);
+
     /* ---- cleanup ---- */
     if (producer != RT_NULL)
     {
