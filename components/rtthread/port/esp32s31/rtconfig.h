@@ -44,6 +44,34 @@
 #define RT_USING_SEMAPHORE
 #define RT_USING_MUTEX
 
+/* Console and shell.
+ *
+ * RT_USING_DEVICE stays off for now, which is why finsh takes the
+ * rt_hw_console_getchar() path (components/finsh/shell.c:210) instead of
+ * reading from a console device. That keeps P2 free of the device framework
+ * and of src/device.c, which this component does not compile yet.
+ *
+ * FINSH_USING_SYMTAB needs __fsymtab_start/__fsymtab_end and the .rti_fn*
+ * table; both are emitted by esp32s31/sections.ld.in under
+ * CONFIG_IDF_RTOS_RTTHREAD.
+ */
+#define RT_USING_CONSOLE
+#define RT_CONSOLEBUF_SIZE              256
+/* INIT_*_EXPORT() expands to nothing without this, which would leave the
+ * .rti_fn table empty and stop finsh_system_init() from ever running. */
+#define RT_USING_COMPONENTS_INIT
+#define RT_USING_FINSH
+#define FINSH_USING_MSH
+#define FINSH_THREAD_NAME               "tshell"
+#define FINSH_THREAD_PRIORITY           20
+#define FINSH_THREAD_STACK_SIZE         4096
+#define FINSH_USING_HISTORY
+#define FINSH_HISTORY_LINES             5
+#define FINSH_USING_SYMTAB
+#define FINSH_USING_DESCRIPTION
+#define FINSH_CMD_SIZE                  80
+#define FINSH_ARG_MAX                   8
+
 /* Interrupt nesting on ESP32-S31 is done in HARDWARE: soc_caps.h defines
  * SOC_INT_CLIC_SUPPORTED and SOC_INT_HW_NESTED_SUPPORTED, so the trap path in
  * vectors_rtthread.S does not touch the interrupt threshold itself - the CLIC

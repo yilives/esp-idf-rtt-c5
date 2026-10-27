@@ -106,6 +106,16 @@ set(common_srcs
     "port/common/context_gcc.S"
     "rtthread_stack_init.c")
 
+# The shell is part of the upstream checkout and is driven by rtconfig.h.
+# shell.c/msh.c/cmd.c/msh_parse.c are compiled unconditionally: every entry
+# point they export is guarded by RT_USING_FINSH, and the linker drops the
+# whole objects when the shell is off.
+set(finsh_srcs
+    "${RTTHREAD_ROOT}/components/finsh/shell.c"
+    "${RTTHREAD_ROOT}/components/finsh/msh.c"
+    "${RTTHREAD_ROOT}/components/finsh/msh_parse.c"
+    "${RTTHREAD_ROOT}/components/finsh/cmd.c")
+
 if(CONFIG_IDF_TARGET_ESP32C3)
     set(target_srcs
         "port/esp32c3/cpuport.c"
@@ -119,7 +129,8 @@ elseif(CONFIG_IDF_TARGET_ESP32C6)
     set(rtt_config_dir "${CMAKE_CURRENT_LIST_DIR}/port/esp32c6")
 elseif(CONFIG_IDF_TARGET_ESP32S31)
     set(target_srcs
-        "port/esp32s31/cpuport.c")
+        "port/esp32s31/cpuport.c"
+        "port/esp32s31/interrupt.c")
     set(rtt_config_dir "${CMAKE_CURRENT_LIST_DIR}/port/esp32s31")
 endif()
 
@@ -130,12 +141,18 @@ set_source_files_properties(${kernel_srcs} ${common_srcs} ${target_srcs} PROPERT
     COMPILE_DEFINITIONS "__RTTHREAD__;__RT_KERNEL_SOURCE__"
     COMPILE_OPTIONS "-ffreestanding;-fno-builtin")
 
-set(srcs ${kernel_srcs} ${common_srcs} ${target_srcs} "port/common/board.c")
+# finsh stores commands as `long (*)(void)` and casts to the real prototype at
+# call time; that is the upstream design and trips -Werror=cast-function-type.
+set_source_files_properties(${finsh_srcs} PROPERTIES
+    COMPILE_DEFINITIONS "__RTTHREAD__;__RT_KERNEL_SOURCE__"
+    COMPILE_OPTIONS "-ffreestanding;-fno-builtin;-Wno-cast-function-type")
+
+set(srcs ${kernel_srcs} ${common_srcs} ${target_srcs} ${finsh_srcs} "port/common/board.c")
 
 idf_component_register(SRCS ${srcs}
     # Upstream headers first, then this component's per-target config directory
     # (rtconfig.h) and cpuport.h / rt_hw_stack_frame.h from upstream libcpu.
-    INCLUDE_DIRS "${RTTHREAD_ROOT}/include" "${rtt_config_dir}"
+    INCLUDE_DIRS "${RTTHREAD_ROOT}/include" "${RTTHREAD_ROOT}/components/finsh" "${rtt_config_dir}"
     PRIV_INCLUDE_DIRS "${rtt_riscv_port_dir}" "${IDF_PATH}/components/freertos"
     PRIV_REQUIRES freertos riscv
     LDFRAGMENTS "linker.lf")
@@ -144,10 +161,14 @@ idf_component_register(SRCS ${srcs}
 # registered earlier (startup, the FreeRTOS tick/port adapters, and applications).
 # rtconfig.h must stay globally visible because those include <rtthread.h>.
 idf_build_set_property(INCLUDE_DIRECTORIES
-    "${RTTHREAD_ROOT}/include;${rtt_config_dir}" APPEND)
+    "${RTTHREAD_ROOT}/include;${RTTHREAD_ROOT}/components/finsh;${rtt_config_dir}" APPEND)
 idf_build_set_property(COMPILE_DEFINITIONS RT_USING_USER_MAIN APPEND)
 # RT-Thread invokes the application's main from a kernel archive. Keep that
 # entry point regardless of the component archive order (as IDF does for app_main).
 target_link_libraries(${COMPONENT_LIB} INTERFACE "-u main")
+# finsh only exports section-based registration data; no symbol in that object
+# is referenced, so the linker would drop the archive members and the .rti_fn
+# table would hold nothing but its boundary markers. Force the entry point in.
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-u finsh_system_init")
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     RT_MAIN_THREAD_STACK_SIZE=CONFIG_ESP_MAIN_TASK_STACK_SIZE)
