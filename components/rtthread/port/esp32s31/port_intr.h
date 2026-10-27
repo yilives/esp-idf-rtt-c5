@@ -50,6 +50,15 @@ int rt_hw_intr_route(int source, int inum);
  */
 void rt_hw_interrupt_set_priority(int vector, rt_uint32_t priority);
 
+/**
+ * Remove a handler installed with rt_hw_interrupt_install().
+ *
+ * Only clears the slot when the pair matches, so an unrelated owner of the same
+ * line is left alone. The line keeps its level and mask state; mask it
+ * explicitly if the interrupt must stop arriving.
+ */
+void rt_hw_interrupt_uninstall(int vector, rt_isr_handler_t handler, void *param);
+
 #ifdef __cplusplus
 }
 #endif

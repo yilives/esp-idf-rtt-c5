@@ -43,8 +43,10 @@
 #include "soc/gpio_struct.h"
 #include "soc/systimer_struct.h"
 #include "hal/gpio_ll.h"
+#include "riscv/interrupt.h"
 #include "esp_rom_sys.h"
 
+#include "port_intr.h"
 #include "port_selftest.h"
 
 /* SYSTIMER_COUNTER_OS_TICK, see esp_hw_support/include/esp_private/systimer.h.
@@ -589,6 +591,206 @@ static int st_irq(rt_base_t pin)
     return ok ? ST_PASS : ST_FAIL;
 }
 
+/* ------------------------------------------------------------------ nest -- */
+
+/*
+ * Two GPIO interrupt channels give two CPU lines at two CLIC levels without any
+ * external wiring:
+ *
+ *   channel 0 -> ETS_GPIO_INUM (4), level 1, driven through the pin driver
+ *   channel 1 -> a spare line,        level 2, driven directly by this test
+ *
+ * Raising the channel 1 status from inside the channel 0 handler must preempt
+ * that very handler. This is the only way to prove the hardware nesting path in
+ * vectors_rtthread.S (save mcause in s1, set mstatus.MIE, restore mcause before
+ * mret) actually works - a single-priority system never exercises it.
+ *
+ * The S31 has four independent GPIO interrupt channels; gpio_ll_intr_enable_on_core()
+ * only implements channel 0 (IDF-7995), which is why channel 1 is programmed
+ * here with raw registers rather than through the driver.
+ */
+
+#define ST_NEST_INNER_INUM      6           /* free: 4 = GPIO, 5 = UART0 */
+#define ST_NEST_INNER_LEVEL     2
+#define ST_NEST_ROUNDS          100
+
+static rt_base_t            s_nest_inner_pin;
+static volatile rt_uint32_t s_nest_outer_count;
+static volatile rt_uint32_t s_nest_inner_count;
+static volatile rt_uint32_t s_nest_outer_depth;
+static volatile rt_uint32_t s_nest_inner_depth;
+static volatile rt_uint32_t s_nest_outer_depth_bad;
+static volatile rt_uint32_t s_nest_inner_depth_bad;
+
+static rt_bool_t st_pin_usable(rt_base_t pin)
+{
+    if (pin < 0 || pin >= SOC_GPIO_PIN_COUNT)
+    {
+        return RT_FALSE;
+    }
+
+    return ((SOC_GPIO_VALID_GPIO_MASK >> pin) & 1ULL) ? RT_TRUE : RT_FALSE;
+}
+
+static rt_base_t st_next_pin(rt_base_t pin)
+{
+    rt_base_t p;
+
+    for (p = pin + 1; p < SOC_GPIO_PIN_COUNT; p++)
+    {
+        if (st_pin_usable(p))
+        {
+            return p;
+        }
+    }
+
+    return -1;
+}
+
+static void st_nest_inner_isr(int vector, void *param)
+{
+    rt_uint32_t lo = GPIO.intr_1.int_1;
+    rt_uint32_t hi = GPIO.intr_11.int_11;
+    rt_uint32_t depth;
+
+    RT_UNUSED(vector);
+    RT_UNUSED(param);
+
+    if (lo)
+    {
+        GPIO.status_w1tc.status_w1tc = lo;
+    }
+    if (hi)
+    {
+        GPIO.status1_w1tc.status1_w1tc = hi;
+    }
+
+    /* Arriving from inside the level 1 handler, this must observe nest == 2. */
+    depth = (rt_uint32_t)rt_interrupt_get_nest();
+    s_nest_inner_depth = depth;
+    if (depth != 2)
+    {
+        s_nest_inner_depth_bad++;
+    }
+
+    s_nest_inner_count++;
+}
+
+static void st_nest_outer_cb(void *args)
+{
+    rt_uint32_t depth = (rt_uint32_t)rt_interrupt_get_nest();
+
+    RT_UNUSED(args);
+
+    s_nest_outer_depth = depth;
+    if (depth != 1)
+    {
+        s_nest_outer_depth_bad++;
+    }
+
+    s_nest_outer_count++;
+
+    /* Fire the level 2 channel while still inside this level 1 handler. */
+    st_irq_trigger(s_nest_inner_pin);
+}
+
+static int st_nest(rt_base_t outer_pin)
+{
+    rt_base_t inner_pin;
+    int i, ok;
+    int saved_prio;
+
+    if (!st_pin_usable(outer_pin))
+    {
+        st_report("nest", ST_FAIL, "bad outer pin %d", (int)outer_pin);
+        return ST_FAIL;
+    }
+
+    inner_pin = st_next_pin(outer_pin);
+    if (inner_pin < 0)
+    {
+        st_report("nest", ST_FAIL, "no usable pin above %d", (int)outer_pin);
+        return ST_FAIL;
+    }
+
+    /* Do not steal a line somebody already configured. */
+    saved_prio = esprv_int_get_priority(ST_NEST_INNER_INUM);
+    if (saved_prio != 0)
+    {
+        st_report("nest", ST_FAIL, "INUM %d already in use at level %d",
+                  ST_NEST_INNER_INUM, saved_prio);
+        return ST_FAIL;
+    }
+
+    s_nest_inner_pin       = inner_pin;
+    s_nest_outer_count     = 0;
+    s_nest_inner_count     = 0;
+    s_nest_outer_depth     = 0;
+    s_nest_inner_depth     = 0;
+    s_nest_outer_depth_bad = 0;
+    s_nest_inner_depth_bad = 0;
+
+    /* --- inner source: GPIO channel 1, spare line, level 2 --- */
+    GPIO.pin[inner_pin].int_type = GPIO_INTR_POSEDGE;
+    GPIO.pin[inner_pin].int_ena  = GPIO_LL_INTR1_ENA;
+
+    if (rt_hw_intr_route(ETS_GPIO_INTR1_SOURCE, ST_NEST_INNER_INUM) != 0)
+    {
+        st_report("nest", ST_FAIL, "route of GPIO_INTR1 failed");
+        GPIO.pin[inner_pin].int_ena = 0;
+        return ST_FAIL;
+    }
+
+    rt_hw_interrupt_set_priority(ST_NEST_INNER_INUM, ST_NEST_INNER_LEVEL);
+    rt_hw_interrupt_install(ST_NEST_INNER_INUM, st_nest_inner_isr, RT_NULL, "gpio1");
+    rt_hw_interrupt_umask(ST_NEST_INNER_INUM);
+
+    /* --- outer source: GPIO channel 0 through the pin driver, level 1 --- */
+    rt_pin_mode(outer_pin, PIN_MODE_INPUT);
+
+    if (rt_pin_attach_irq(outer_pin, PIN_IRQ_MODE_RISING, st_nest_outer_cb, RT_NULL) != RT_EOK)
+    {
+        st_report("nest", ST_FAIL, "attach failed on pin %d", (int)outer_pin);
+        rt_hw_interrupt_mask(ST_NEST_INNER_INUM);
+        rt_hw_interrupt_uninstall(ST_NEST_INNER_INUM, st_nest_inner_isr, RT_NULL);
+        GPIO.pin[inner_pin].int_ena = 0;
+        return ST_FAIL;
+    }
+
+    rt_pin_irq_enable(outer_pin, PIN_IRQ_ENABLE);
+
+    for (i = 0; i < ST_NEST_ROUNDS; i++)
+    {
+        /* From thread context this raises the level 1 line; the handler then
+         * raises the level 2 line from inside itself. */
+        st_irq_trigger(outer_pin);
+        esp_rom_delay_us(300);
+    }
+
+    /* --- stop and restore --- */
+    rt_pin_irq_enable(outer_pin, PIN_IRQ_DISABLE);
+    rt_pin_detach_irq(outer_pin);
+
+    GPIO.pin[inner_pin].int_ena = 0;
+    rt_hw_interrupt_mask(ST_NEST_INNER_INUM);
+    rt_hw_interrupt_uninstall(ST_NEST_INNER_INUM, st_nest_inner_isr, RT_NULL);
+
+    ok = (s_nest_outer_count == ST_NEST_ROUNDS) &&
+         (s_nest_inner_count == ST_NEST_ROUNDS) &&
+         (s_nest_outer_depth_bad == 0) &&
+         (s_nest_inner_depth_bad == 0);
+
+    st_report("nest", ok,
+              "pin %d->%d: outer %u@nest%u, inner %u@nest%u (want %d, %u bad)",
+              (int)outer_pin, (int)inner_pin,
+              s_nest_outer_count, s_nest_outer_depth,
+              s_nest_inner_count, s_nest_inner_depth,
+              ST_NEST_ROUNDS,
+              s_nest_outer_depth_bad + s_nest_inner_depth_bad);
+
+    return ok ? ST_PASS : ST_FAIL;
+}
+
 /* ------------------------------------------------------------------- sem -- */
 
 static struct rt_semaphore s_sem;
@@ -677,6 +879,7 @@ static int st_all(int seconds, rt_base_t pin)
     st_preempt(seconds);
     st_fpu();
     st_irq(pin);
+    st_nest(pin);
     st_sem();
 
     rt_kprintf("=== %d passed, %d failed ===\n\n", s_pass, s_fail);
@@ -686,13 +889,14 @@ static int st_all(int seconds, rt_base_t pin)
 
 static void st_usage(void)
 {
-    rt_kprintf("usage: s31test [all|tick|ctx|preempt|fpu|irq|sem] [args]\n");
+    rt_kprintf("usage: s31test [all|tick|ctx|preempt|fpu|irq|nest|sem] [args]\n");
     rt_kprintf("  s31test              run everything (5 s preemption, pin %d)\n", 10);
     rt_kprintf("  s31test tick         tick rate vs SYSTIMER and CPU cycles\n");
     rt_kprintf("  s31test ctx          four-thread cooperative switch, stack guards\n");
     rt_kprintf("  s31test preempt [s]  integer threads vs 1 kHz preemption\n");
     rt_kprintf("  s31test fpu          f0-f31 across thread switches\n");
     rt_kprintf("  s31test irq [pin]    software-triggered GPIO interrupt\n");
+    rt_kprintf("  s31test nest [pin]   level 2 preempting level 1 (GPIO ch0/ch1)\n");
     rt_kprintf("  s31test sem          semaphore ping-pong\n");
 }
 
@@ -734,6 +938,12 @@ static int st_cmd(int argc, char **argv)
     {
         rt_base_t pin = (argc >= 3) ? (rt_base_t)atoi(argv[2]) : 10;
         return st_irq(pin);
+    }
+
+    if (rt_strcmp(argv[1], "nest") == 0)
+    {
+        rt_base_t pin = (argc >= 3) ? (rt_base_t)atoi(argv[2]) : 10;
+        return st_nest(pin);
     }
 
     if (rt_strcmp(argv[1], "sem") == 0)
