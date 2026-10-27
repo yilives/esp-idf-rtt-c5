@@ -265,6 +265,55 @@ void vTaskDelete(TaskHandle_t xTaskToDelete)
     ft_task_delete(xTaskToDelete);
 }
 
+/*
+ * Stack high water mark.
+ *
+ * INCLUDE_uxTaskGetStackHighWaterMark is 1 in this configuration, so task.h
+ * declares this function to every caller, and tasks.c - the only definition -
+ * is not compiled when the shim is on. The first caller would have hit an
+ * undefined reference at link time. That is the ordinary reason this exists.
+ *
+ * The interesting part is that it can be implemented at all. FreeRTOS measures
+ * the mark by filling a new stack with a known pattern and counting what is left
+ * untouched; RT-Thread does exactly the same with '#' - src/thread.c:210,
+ * rt_memset(thread->stack_addr, '#', thread->stack_size) - so the information is
+ * already there and needs no extra bookkeeping in the port.
+ *
+ * The stack grows downward, so the survivors are at the bottom of the buffer and
+ * the mark is the offset of the first byte that is no longer '#'.
+ */
+UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t xTask)
+{
+    rt_thread_t thread = xTask ? (rt_thread_t)xTask : rt_thread_self();
+    const rt_uint8_t *base;
+    rt_uint32_t       size;
+    rt_uint32_t       free_bytes = 0;
+
+    if (thread == RT_NULL)
+    {
+        return 0;
+    }
+
+    base = (const rt_uint8_t *)thread->stack_addr;
+    size = thread->stack_size;
+
+    if (base == RT_NULL || size == 0)
+    {
+        return 0;
+    }
+
+    while (free_bytes < size && base[free_bytes] == '#')
+    {
+        free_bytes++;
+    }
+
+    /* FreeRTOS reports the count in StackType_t units, which on this port is one
+     * byte (FT_STACK_UNIT_BYTES, asserted against sizeof(StackType_t) above).
+     * No conversion, and worth saying out loud because the IDF documentation
+     * describes the unit as a word. */
+    return (UBaseType_t)free_bytes;
+}
+
 void vTaskSuspend(TaskHandle_t xTaskToSuspend)
 {
     ft_task_suspend(xTaskToSuspend);

@@ -1270,6 +1270,38 @@ static int st_fbshim(void)
     st_report("fbshim/exit", bad == 0,
               "TLS slot freed when the task returns (%d bad)", bad);
 
+    /* ---- 6c. stack high water mark ----
+     *
+     * RT-Thread fills a new stack with '#' (src/thread.c:210) and grows it
+     * downward, so the untouched tail at the bottom is the high water mark.
+     * Checking it here proves the scan works at all; the value itself is only
+     * interesting relative to the thread's own stack size.
+     *
+     * Declared locally rather than by including task.h: this file is also built
+     * without the shim, where FreeRTOS headers would only add noise. The
+     * signature is the one in freertos_api.c.
+     */
+    bad = 0;
+    {
+        extern unsigned uxTaskGetStackHighWaterMark(void *xTask);
+
+        unsigned    mark = uxTaskGetStackHighWaterMark(NULL);
+        rt_thread_t self = rt_thread_self();
+
+        if (mark == 0)
+        {
+            bad++;              /* every byte touched, or the scan failed */
+        }
+        if (self != RT_NULL && (rt_uint32_t)mark > self->stack_size)
+        {
+            bad++;              /* cannot report more free than there is stack */
+        }
+
+        total_bad += bad;
+        st_report("fbshim/hwm", bad == 0,
+                  "stack high water mark %u bytes free (%d bad)", mark, bad);
+    }
+
     /* ---- 7. blocking with the scheduler locked is refused, not hung ---- */
     bad = 0;
     {
