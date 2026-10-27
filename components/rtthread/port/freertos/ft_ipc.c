@@ -169,6 +169,20 @@ struct ft_ipc *ft_ipc_create(ft_ubase_t length, ft_ubase_t item_size)
         return RT_NULL;
     }
 
+    /* ft_ubase_t is unsigned long, which is 32 bits here, so
+     * length * item_size can wrap. A 65536-entry queue of 65536-byte items
+     * would ask rt_malloc for 0 bytes, succeed, and then let the first send
+     * write past the end of a zero-length buffer - a heap corruption whose
+     * report arrives somewhere unrelated. FreeRTOS rejects the same combination
+     * by returning NULL from xQueueGenericCreate.
+     *
+     * RT_SIZE_MAX rather than SIZE_MAX: rtdef.h picks the right width for the
+     * target, and it is already on the include path. */
+    if (item_size != 0 && length > (ft_ubase_t)(RT_SIZE_MAX / item_size))
+    {
+        return RT_NULL;
+    }
+
     q = rt_malloc(sizeof(*q));
     if (q == RT_NULL)
     {

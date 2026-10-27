@@ -1302,6 +1302,76 @@ static int st_fbshim(void)
                   "stack high water mark %u bytes free (%d bad)", mark, bad);
     }
 
+    /* ---- 6d. task introspection ----
+     *
+     * These exist because task.h declares them unconditionally while tasks.c,
+     * the only definition, is not compiled with the shim. Each one is a few
+     * lines of RT-Thread, and none of them had a caller in this image - so the
+     * only way to know they work is to call them from here.
+     */
+    bad = 0;
+    {
+        extern unsigned   uxTaskGetNumberOfTasks(void);
+        extern char      *pcTaskGetName(void *xTask);
+        extern void      *xTaskGetHandle(const char *name);
+        extern void      *xTaskGetIdleTaskHandle(void);
+        extern unsigned   eTaskGetState(void *xTask);
+
+        unsigned    count = uxTaskGetNumberOfTasks();
+        char       *self_name = pcTaskGetName(NULL);
+        void       *by_name;
+        void       *idle = xTaskGetIdleTaskHandle();
+        unsigned    state_self = eTaskGetState(NULL);
+
+        /* There is always at least this thread and idle. */
+        if (count < 2)
+        {
+            bad++;
+        }
+
+        if (self_name == RT_NULL || self_name[0] == '\0')
+        {
+            bad++;
+        }
+
+        /* Look ourselves up by the name the kernel reports, then confirm the
+         * handle comes back identical. This is the round trip rt_object_find
+         * performs, not just a pointer echo. */
+        by_name = (self_name != RT_NULL) ? xTaskGetHandle(self_name) : RT_NULL;
+        if (by_name != rt_thread_self())
+        {
+            bad++;
+        }
+
+        /* A name nobody has must come back NULL rather than the first thread. */
+        if (xTaskGetHandle("no-such-task") != RT_NULL)
+        {
+            bad++;
+        }
+
+        if (idle == RT_NULL)
+        {
+            bad++;
+        }
+
+        /* eRunning == 0; we are running by definition. */
+        if (state_self != 0)
+        {
+            bad++;
+        }
+
+        /* And idle must not look like it is running while we hold the CPU. */
+        if (idle != RT_NULL && eTaskGetState(idle) == 0)
+        {
+            bad++;
+        }
+
+        total_bad += bad;
+        st_report("fbshim/query", bad == 0,
+                  "%u tasks, name '%s', lookup+state+idle ok (%d bad)",
+                  count, self_name ? self_name : "?", bad);
+    }
+
     /* ---- 7. blocking with the scheduler locked is refused, not hung ---- */
     bad = 0;
     {
@@ -1348,6 +1418,25 @@ static int st_fbshim(void)
             {
                 bad++;
             }
+
+            /* vTaskDelay needs the same guard, and it needs it with more
+             * urgency: rt_schedule() does nothing while the scheduler is
+             * locked, so a delay there would leave this thread off the ready
+             * queue instead of returning an error. Verified by timing - if the
+             * guard is gone, we never come back at all and the test times out
+             * rather than failing quietly. */
+            {
+                rt_uint64_t t0 = st_now_us();
+
+                ft_task_delay(50);
+                ft_task_delay(FT_MAX_DELAY);
+
+                if ((st_now_us() - t0) > 5000u)
+                {
+                    bad++;      /* it actually slept, which it must not */
+                }
+            }
+
             rt_exit_critical();
 
             ft_ipc_delete(gq);

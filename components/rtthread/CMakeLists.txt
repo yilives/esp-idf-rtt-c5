@@ -167,6 +167,7 @@ elseif(CONFIG_IDF_TARGET_ESP32S31)
     if(CONFIG_IDF_RTOS_RTTHREAD_FREERTOS_SHIM)
         list(APPEND target_srcs
             "port/freertos/freertos_api.c"
+            "port/freertos/ft_query.c"
             "port/freertos/ft_notify.c")
     endif()
     set(rtt_config_dir "${CMAKE_CURRENT_LIST_DIR}/port/esp32s31")

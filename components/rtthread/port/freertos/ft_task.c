@@ -136,6 +136,23 @@ void ft_task_delay(ft_tick_t ticks)
         return;
     }
 
+    /* Sleeping with the scheduler locked, or from an ISR, has to be refused -
+     * the same rule ft_ipc.c enforces on every blocking call, and for the same
+     * reason. rt_schedule() is a no-op while rt_scheduler_lock_nest is non-zero
+     * (src/scheduler_up.c:296), so _thread_sleep() would suspend this thread,
+     * fail to switch away, and return with the thread off the ready queue and
+     * its status still set to suspend. The next reschedule parks it forever,
+     * with no trace of where it stopped.
+     *
+     * FreeRTOS asserts here too (configASSERT( uxSchedulerSuspended == 0 ) in
+     * vTaskDelay), so refusing is the port-compatible behaviour, not a
+     * deviation. This path was missing the guard while every queue and
+     * semaphore call had it. */
+    if (!ft_block_allowed(ticks, "vTaskDelay"))
+    {
+        return;
+    }
+
     /* portMAX_DELAY means "forever", and it used to reach
      * rt_thread_mdelay() by luck: 0xFFFFFFFF * 1000 / 1000 stays 0xFFFFFFFF,
      * the cast to rt_int32_t makes it -1, and rt_tick_from_millisecond()

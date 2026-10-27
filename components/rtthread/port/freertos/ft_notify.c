@@ -125,6 +125,21 @@ static struct ft_notify *ft_notify_lookup(rt_thread_t thread, rt_bool_t create)
 
     if (!create || free_entry == RT_NULL)
     {
+        /* Table full, and the caller is about to lose a wakeup. Silent would be
+         * the worst answer: a notification that goes nowhere looks exactly like
+         * a slow peer, so the bug gets chased in the wrong component. The TLS
+         * table reports the same condition the same way. */
+        if (create && free_entry == RT_NULL)
+        {
+            static rt_uint32_t warned;
+
+            if (!warned)
+            {
+                warned = 1;
+                rt_kprintf("freertos-shim: notification table full (%d tasks); "
+                           "notifications are being dropped\n", FT_NOTIFY_TASKS);
+            }
+        }
         return RT_NULL;
     }
 

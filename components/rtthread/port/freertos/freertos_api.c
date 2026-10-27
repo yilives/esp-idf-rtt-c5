@@ -314,6 +314,55 @@ UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t xTask)
     return (UBaseType_t)free_bytes;
 }
 
+UBaseType_t uxTaskGetNumberOfTasks(void)
+{
+    return (UBaseType_t)ft_task_count();
+}
+
+char *pcTaskGetName(TaskHandle_t xTaskToQuery)
+{
+    return (char *)ft_task_name(xTaskToQuery);
+}
+
+TaskHandle_t xTaskGetHandle(const char *pcNameToQuery)
+{
+    return (TaskHandle_t)ft_task_find(pcNameToQuery);
+}
+
+TaskHandle_t xTaskGetIdleTaskHandle(void)
+{
+    return (TaskHandle_t)ft_task_idle_handle();
+}
+
+/* eTaskState is an enum in task.h; the numeric value comes back through
+ * ft_task_state() so this file does not have to include task.h's enum twice.
+ * The cast is safe because ft_query.c documents that the values line up. */
+eTaskState eTaskGetState(TaskHandle_t xTask)
+{
+    return (eTaskState)ft_task_state(xTask);
+}
+
+BaseType_t xTaskAbortDelay(TaskHandle_t xTask)
+{
+    return (BaseType_t)ft_task_abort_delay(xTask);
+}
+
+BaseType_t xTaskResumeFromISR(TaskHandle_t xTaskToResume)
+{
+    ft_base_t woken = ftFAIL;
+
+    (void)ft_task_resume_isr(xTaskToResume, &woken);
+
+    return (BaseType_t)woken;
+}
+
+BaseType_t xTaskDelayUntil(TickType_t *const pxPreviousWakeTime,
+                           const TickType_t xTimeIncrement)
+{
+    return (BaseType_t)ft_task_delay_until((ft_tick_t *)pxPreviousWakeTime,
+                                           (ft_tick_t)xTimeIncrement);
+}
+
 void vTaskSuspend(TaskHandle_t xTaskToSuspend)
 {
     ft_task_suspend(xTaskToSuspend);

@@ -287,6 +287,39 @@ void ft_task_set_tls_with_cb(void *handle, ft_ubase_t index, void *value,
 /** Occupied slots. For the self test: the release path is otherwise invisible. */
 rt_uint32_t ft_tls_slots_used(void);
 
+/* ------------------------------------------------- task introspection ----- */
+
+/*
+ * Declared unconditionally by task.h, defined only by tasks.c, which is not
+ * compiled when the shim is on. Defining them here is not optional: the first
+ * caller to use one fails at link time, in a file whose author had no way to
+ * know the shim was involved.
+ */
+
+/** uxTaskGetNumberOfTasks(). Includes idle. */
+ft_ubase_t ft_task_count(void);
+
+/** pcTaskGetName(). NULL means the caller. */
+const char *ft_task_name(void *handle);
+
+/** xTaskGetHandle(): look a thread up by name. */
+void *ft_task_find(const char *name);
+
+/** xTaskGetIdleTaskHandle(). */
+void *ft_task_idle_handle(void);
+
+/** eTaskGetState(). Returns the numeric value of the eTaskState enum. */
+rt_uint32_t ft_task_state(void *handle);
+
+/** xTaskAbortDelay(). */
+ft_base_t ft_task_abort_delay(void *handle);
+
+/** xTaskResumeFromISR(). */
+ft_base_t ft_task_resume_isr(void *handle, ft_base_t *woken);
+
+/** xTaskDelayUntil(). @p prev is in FreeRTOS ticks and is advanced in place. */
+ft_base_t ft_task_delay_until(ft_tick_t *prev, ft_tick_t increment);
+
 /* ------------------------------------------------------- task notification -- */
 
 /*

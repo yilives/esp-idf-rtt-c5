@@ -127,6 +127,16 @@ rt_uint32_t ft_event_wait_bits(struct ft_event *event, rt_uint32_t bits,
         option |= RT_EVENT_FLAG_CLEAR;
     }
 
+    /* The same guard every other blocking call in this port has, which this one
+     * was missing. rt_event_recv() suspends the caller when the bits are not
+     * there yet; with the scheduler locked rt_schedule() is a no-op, so the
+     * thread is left off the ready queue with its status still set to suspend
+     * and nothing to wake it. FreeRTOS asserts on the same condition. */
+    if (!ft_block_allowed(ticks, "xEventGroupWaitBits"))
+    {
+        return 0;
+    }
+
     if (rt_event_recv(&event->event, bits, option, ft_ticks_to_rt(ticks),
                       &received) != RT_EOK)
     {
