@@ -182,6 +182,47 @@ ft_base_t  ft_ipc_is_empty(struct ft_ipc *ipc);
 ft_ubase_t ft_ipc_messages_waiting(struct ft_ipc *ipc);
 ft_ubase_t ft_ipc_spaces_available(struct ft_ipc *ipc);
 
+/* -------------------------------------------------------------- queue set -- */
+
+/*
+ * Wait-any over a group of queues. Only esp_ble_mesh and esp_ble_iso use it, and
+ * neither is in this image; the implementation exists so those components fail
+ * with a real error rather than a link error or a hang if they are ever enabled.
+ */
+void *ft_qset_create(ft_ubase_t length);
+
+/** Add a member. The queue must be empty, as FreeRTOS requires. */
+ft_base_t ft_qset_add(void *set, struct ft_ipc *queue);
+
+ft_base_t ft_qset_remove(void *set, struct ft_ipc *queue);
+
+/** Called by ft_ipc_send() after an item lands, so the set knows to wake up. */
+void ft_qset_signal(struct ft_ipc *queue);
+
+/** Returns the member that has data, or NULL. */
+void *ft_qset_select(void *set, ft_tick_t ticks, ft_base_t *timed_out);
+void *ft_qset_select_isr(void *set, ft_base_t *timed_out);
+
+/** Drop a queue's membership; called from ft_ipc_delete(). */
+void ft_qset_forget(struct ft_ipc *queue);
+
+/* Membership is stored inside struct ft_ipc, which only ft_ipc.c can see. These
+ * two keep it that way instead of opening the struct up to every file. */
+void  ft_ipc_set_membership(struct ft_ipc *ipc, void *set);
+void *ft_ipc_get_membership(struct ft_ipc *ipc);
+
+/* ------------------------------------------------------- peek and reset --- */
+
+/** xQueuePeek(): copy the front item without consuming it. */
+int ft_ipc_peek(struct ft_ipc *ipc, void *item, ft_tick_t ticks);
+
+/** xQueueGenericReset(): empty the queue, keep the capacity. */
+int ft_ipc_reset(struct ft_ipc *ipc);
+
+/** xQueueOverwrite(): replace the item in a length-1 queue. Never fails. */
+int ft_ipc_overwrite(struct ft_ipc *ipc, const void *item);
+int ft_ipc_overwrite_isr(struct ft_ipc *ipc, const void *item, ft_base_t *woken);
+
 /* ------------------------------------------------------------------ event -- */
 
 struct ft_event;

@@ -55,6 +55,13 @@ struct ft_ipc
      * small to hold struct ft_ipc. Kept so xQueueGetStaticBuffers() can hand
      * the caller's own block back for it to free. */
     void       *static_cb;
+
+    /* The queue set this queue belongs to, or NULL. FreeRTOS requires that a
+     * queue be empty when it is added to a set, and the set is notified on every
+     * successful send - that notification is what xQueueSelectFromSet() waits
+     * on. Kept as an opaque pointer because ft_qset lives in ft_compat.c and
+     * this file must not depend on it. */
+    void       *set;
 };
 
 /* FreeRTOS ticks to RT-Thread ticks. Both are 1 kHz in this configuration, but
@@ -362,6 +369,10 @@ void ft_ipc_delete(struct ft_ipc *ipc)
         return;
     }
 
+    /* A deleted queue must not stay in a queue set: the set would keep the
+     * pointer and the next select would dereference freed memory. */
+    ft_qset_forget(ipc);
+
     if (ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX)
     {
         rt_mutex_detach(&ipc->mutex);
@@ -462,6 +473,11 @@ int ft_ipc_send(struct ft_ipc *ipc, const void *item, ft_tick_t ticks)
     ft_ipc_push(ipc, item);
     rt_sem_release(&ipc->available);
 
+    /* Tell the queue set, if this queue is a member of one. Done for the blocking
+     * and the ISR path separately below, because the ISR one must not touch the
+     * scheduler. */
+    ft_qset_signal(ipc);
+
     return FT_OK;
 }
 
@@ -489,6 +505,7 @@ int ft_ipc_send_isr(struct ft_ipc *ipc, const void *item, ft_base_t *woken)
 
     ft_ipc_push(ipc, item);
     rt_sem_release(&ipc->available);
+    ft_qset_signal(ipc);
 
     /* Conservative: RT-Thread's release does not report whether a waiter was
      * unblocked, so always ask for a reschedule. An unnecessary yield only
@@ -713,4 +730,229 @@ ft_ubase_t ft_ipc_spaces_available(struct ft_ipc *ipc)
     }
 
     return (ipc->length > ipc->count) ? (ipc->length - ipc->count) : 0;
+}
+
+/* -------------------------------------------------------------- overwrite -- */
+
+/*
+ * xQueueOverwrite / xQueueOverwriteFromISR.
+ *
+ * FreeRTOS only defines these for queues of length one - they assert
+ * uxQueueLength == 1 - and the semantics are "replace whatever is there, never
+ * block, never fail". That is how a driver publishes the latest of something (a
+ * GPIO event, an ADC sample) to a consumer that does not need every one.
+ *
+ * The earlier version of this port treated queueOVERWRITE as queueSEND_TO_BACK
+ * and warned about it. That is wrong in a way that would have been hard to see:
+ * the first overwrite on a full queue would have returned "full" where FreeRTOS
+ * returns success, so the producer would have reported an error while the
+ * consumer kept reading stale data. One of the I2C driver's event paths uses it
+ * from an ISR.
+ */
+int ft_ipc_overwrite(struct ft_ipc *ipc, const void *item)
+{
+    rt_base_t level;
+    rt_bool_t was_empty;
+
+    if (ipc == RT_NULL || item == RT_NULL ||
+        ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX ||
+        ipc->item_size == 0)
+    {
+        return FT_ERR_PARAM;
+    }
+
+    /* FreeRTOS asserts length == 1 for this call, and enforcing it keeps the
+     * meaning unambiguous: on a longer queue "overwrite" would silently drop
+     * every queued item but the newest, so a caller that expected a normal queue
+     * would lose data instead of getting an error. */
+    if (ipc->length != 1)
+    {
+        static rt_uint32_t warned;
+
+        if (!warned)
+        {
+            warned = 1;
+            rt_kprintf("freertos-shim: xQueueOverwrite needs a length-1 queue "
+                       "(this one has %u)\n", (unsigned)ipc->length);
+        }
+        return FT_ERR_PARAM;
+    }
+
+    level = rt_hw_interrupt_disable();
+
+    was_empty = (ipc->count == 0);
+
+    /* One slot, so head and tail cannot differ by more than the wrap. Writing at
+     * tail and leaving count at 1 makes the next receive take exactly this item.
+     *
+     * The free-slot count has to move together with `count`, because the ring's
+     * invariant is
+     *
+     *     count + free_slots.value == length
+     *
+     * A send takes a free slot, a receive gives one back. Leaving free_slots
+     * alone on the empty-to-full transition would advertise a free slot that no
+     * longer exists, and the next ordinary send would succeed and push a second
+     * item into a one-slot ring - silent corruption past the end of the buffer.
+     * The first version of this function did exactly that; the self test is
+     * written to catch it. */
+    rt_memcpy(ipc->buf + ipc->tail * ipc->item_size, item, ipc->item_size);
+
+    ipc->head  = (ipc->tail + 1u) % ipc->length;
+    ipc->count = 1;
+
+    /* Setting the counter directly rather than taking it: an overwrite must not
+     * block, and there is never a legitimate waiter on a full length-1 queue. */
+    ipc->free_slots.value = 0;
+
+    rt_hw_interrupt_enable(level);
+
+    /* Only the empty-to-full transition has to wake a receiver, and only that
+     * transition may release the count - releasing a count that is already
+     * there would let a later receive return an item that is not present. Done
+     * with interrupts on because rt_sem_release can reschedule. */
+    if (was_empty)
+    {
+        rt_sem_release(&ipc->available);
+        ft_qset_signal(ipc);
+    }
+
+    return FT_OK;
+}
+
+int ft_ipc_overwrite_isr(struct ft_ipc *ipc, const void *item, ft_base_t *woken)
+{
+    int rc = ft_ipc_overwrite(ipc, item);
+
+    /* rt_sem_release() inside has already made a waiting receiver ready; the
+     * caller only uses this flag to decide whether to yield on the way out. */
+    if (woken != RT_NULL)
+    {
+        *woken = (rc == FT_OK) ? ftPASS : ftFAIL;
+    }
+
+    return rc;
+}
+
+/* ------------------------------------------------------------ peek, reset -- */
+
+/*
+ * xQueuePeek and xQueueGenericReset, both declared in queue.h unconditionally.
+ * Neither has a caller in this image; they are here because the alternative is an
+ * undefined reference the first time a driver reaches for one, in a file whose
+ * author has no reason to know the shim exists.
+ */
+
+/* Copy the front item without removing it.
+ *
+ * The wait is done on the same `available` semaphore a receive uses, but taken
+ * as a try-take plus a sleep loop rather than rt_sem_take: rt_sem_take would
+ * decrement the count, and a peek must leave it alone. Sleeping a tick between
+ * tries is slower to wake than a real waiter would be, but a peek is a polling
+ * call by nature and nothing here is on a hot path.
+ */
+int ft_ipc_peek(struct ft_ipc *ipc, void *item, ft_tick_t ticks)
+{
+    rt_uint32_t elapsed = 0;
+
+    if (ipc == RT_NULL || item == RT_NULL ||
+        ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX)
+    {
+        return FT_ERR_PARAM;
+    }
+
+    if (ipc->item_size == 0)
+    {
+        return FT_ERR_PARAM;    /* a semaphore has nothing to peek at */
+    }
+
+    for (;;)
+    {
+        rt_base_t level = rt_hw_interrupt_disable();
+        rt_uint32_t count = ipc->count;
+        rt_uint32_t tail = ipc->tail;
+
+        if (count != 0)
+        {
+            rt_memcpy(item, ipc->buf + tail * ipc->item_size, ipc->item_size);
+            rt_hw_interrupt_enable(level);
+            return FT_OK;
+        }
+        rt_hw_interrupt_enable(level);
+
+        if (ticks == 0)
+        {
+            return FT_ERR_TIMEOUT;
+        }
+
+        if (ticks != FT_MAX_DELAY && elapsed >= ticks)
+        {
+            return FT_ERR_TIMEOUT;
+        }
+
+        if (!ft_block_allowed(ticks == FT_MAX_DELAY ? 1 : ticks, "xQueuePeek"))
+        {
+            return FT_ERR_STATE;
+        }
+
+        /* One tick is exactly one millisecond in this configuration, but the
+         * conversion is written out so a change to either rate cannot turn this
+         * into a busy loop. */
+        rt_thread_mdelay((rt_int32_t)((1000u + CONFIG_FREERTOS_HZ - 1u)
+                                      / CONFIG_FREERTOS_HZ));
+        elapsed += 1;
+    }
+}
+
+/* Empty the queue, keeping its capacity.
+ *
+ * Every waiting sender and receiver is released first: rt_sem_detach would do
+ * that, but these semaphores stay alive. rt_sem_release in a loop is wrong the
+ * other way - a receiver woken by the reset has nothing to consume and would
+ * re-block, which is only wasted work, while a sender that stays blocked after a
+ * reset would hang. So the free-slot count is restored to full, which is what
+ * unblocks senders, and the available count is zeroed, which is what a receiver
+ * sees as empty.
+ *
+ * Setting sem.value directly is safe here because both counts belong to this
+ * object and the reset is defined to be exclusive: FreeRTOS documents the same
+ * restriction ("must not be called while the queue is in use").
+ */
+int ft_ipc_reset(struct ft_ipc *ipc)
+{
+    rt_base_t level;
+
+    if (ipc == RT_NULL ||
+        ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX)
+    {
+        return FT_ERR_PARAM;
+    }
+
+    level = rt_hw_interrupt_disable();
+
+    ipc->head  = 0;
+    ipc->tail  = 0;
+    ipc->count = 0;
+
+    ipc->available.value  = 0;
+    ipc->free_slots.value = ipc->length;
+
+    rt_hw_interrupt_enable(level);
+
+    return FT_OK;
+}
+
+/* Queue-set membership. Two accessors rather than a public struct: struct ft_ipc
+ * is private to this file on purpose, and one pointer is all ft_qset.c needs. */
+void ft_ipc_set_membership(struct ft_ipc *ipc, void *set)
+{
+    if (ipc != RT_NULL)
+    {
+        ipc->set = set;
+    }
+}
+
+void *ft_ipc_get_membership(struct ft_ipc *ipc)
+{
+    return (ipc != RT_NULL) ? ipc->set : RT_NULL;
 }

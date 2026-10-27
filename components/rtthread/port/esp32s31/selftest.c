@@ -1372,6 +1372,277 @@ static int st_fbshim(void)
                   count, self_name ? self_name : "?", bad);
     }
 
+    /* ---- 6e. link probe ----
+     *
+     * ft_probe.c is a table of every FreeRTOS function the IDF headers promise.
+     * Its value is entirely at link time: if one of them has no definition the
+     * build fails with that name. This reference is what keeps the table in the
+     * image, because --gc-sections drops unreferenced sections before their
+     * contents are resolved - which made the first two versions of the probe
+     * pass whether or not the symbols existed.
+     *
+     * The assertion here is only that the reference survived: a non-zero count
+     * means the section is really in the image.
+     */
+    bad = 0;
+    {
+        extern const void *const ft_link_probe[];
+        extern const unsigned  ft_link_probe_count;
+
+        if (ft_link_probe_count == 0 || ft_link_probe[0] == RT_NULL)
+        {
+            bad++;
+        }
+
+        total_bad += bad;
+        st_report("fbshim/probe", bad == 0,
+                  "%u FreeRTOS entry points resolved at link time (%d bad)",
+                  ft_link_probe_count, bad);
+    }
+
+    /* ---- 6f. queue set ----
+     *
+     * Wait-any over several queues. Only esp_ble_mesh and esp_ble_iso use it, so
+     * nothing in this image would catch a mistake here; the test is the only
+     * evidence the implementation works at all.
+     *
+     * The interesting part is the bookkeeping: the set's semaphore counts one
+     * release per send, so it can say "some member is ready" without knowing
+     * which one. That is why select loops instead of taking once.
+     */
+    bad = 0;
+    {
+        void         *set = ft_qset_create(4);
+        struct ft_ipc *qa = ft_ipc_create(2, sizeof(struct st_shim_msg));
+        struct ft_ipc *qb = ft_ipc_create(2, sizeof(struct st_shim_msg));
+        struct st_shim_msg m;
+        void         *picked;
+
+        if (set == RT_NULL || qa == RT_NULL || qb == RT_NULL)
+        {
+            bad++;
+        }
+        else
+        {
+            /* A queue that is not empty must be refused: the set's counter does
+             * not know about items already in it, so they would never produce a
+             * notification and the queue would look empty forever. */
+            m.seq = 1;
+            if (ft_ipc_send(qa, &m, FT_NO_WAIT) != FT_OK)
+            {
+                bad++;
+            }
+            if (ft_qset_add(set, qa) != ftFAIL)
+            {
+                bad++;
+            }
+
+            /* Drain it, then it can join. */
+            if (ft_ipc_receive(qa, &m, FT_NO_WAIT) != FT_OK)
+            {
+                bad++;
+            }
+            if (ft_qset_add(set, qa) != ftPASS || ft_qset_add(set, qb) != ftPASS)
+            {
+                bad++;
+            }
+
+            /* Nothing ready: a zero timeout must return NULL, not a member. */
+            if (ft_qset_select(set, FT_NO_WAIT, RT_NULL) != RT_NULL)
+            {
+                bad++;
+            }
+
+            /* Post to the second member and check that is what comes back -
+             * a set that always returned the first member would pass a
+             * single-member test but is wrong. */
+            m.seq = 0x2222;
+            if (ft_ipc_send(qb, &m, FT_NO_WAIT) != FT_OK)
+            {
+                bad++;
+            }
+            picked = ft_qset_select(set, FT_NO_WAIT, RT_NULL);
+            if (picked != qb)
+            {
+                bad++;
+            }
+
+            /* One item, one notification: consuming the item must leave the set
+             * empty again. */
+            if (ft_qset_select(set, FT_NO_WAIT, RT_NULL) != RT_NULL)
+            {
+                bad++;
+            }
+
+            /* Removing a member must not disturb the others. */
+            if (ft_qset_remove(set, qb) != ftPASS)
+            {
+                bad++;
+            }
+            m.seq = 0x1111;
+            if (ft_ipc_send(qa, &m, FT_NO_WAIT) != FT_OK)
+            {
+                bad++;
+            }
+            if (ft_qset_select(set, FT_NO_WAIT, RT_NULL) != qa)
+            {
+                bad++;
+            }
+        }
+
+        if (qa) ft_ipc_delete(qa);
+        if (qb) ft_ipc_delete(qb);
+
+        total_bad += bad;
+        st_report("fbshim/qset", bad == 0,
+                  "membership, exact notify, remove, stale notification (%d bad)",
+                  bad);
+    }
+
+    /* ---- 6g. overwrite, peek, reset ----
+     *
+     * Three queue operations nothing in this image calls, added because
+     * queue.h declares them unconditionally and a driver reaching for one would
+     * otherwise fail to link.
+     *
+     * xQueueOverwrite is the interesting one: on a length-1 queue it must never
+     * report full, and the second call must replace the first rather than
+     * queue behind it. The earlier version of this port treated it as an append
+     * and warned - which would have returned "full" where FreeRTOS returns
+     * success, so a producer would have logged an error while the consumer read
+     * stale data.
+     */
+    bad = 0;
+    {
+        struct ft_ipc *q1 = ft_ipc_create(1, sizeof(struct st_shim_msg));
+        struct ft_ipc *q3 = ft_ipc_create(3, sizeof(struct st_shim_msg));
+        struct st_shim_msg m;
+        struct st_shim_msg out;
+
+        if (q1 == RT_NULL || q3 == RT_NULL)
+        {
+            bad++;
+        }
+        else
+        {
+            /* overwrite into an empty queue, repeatedly: every call succeeds
+             * and only the last value survives. */
+            m.seq = 1;
+            if (ft_ipc_overwrite(q1, &m) != FT_OK)
+            {
+                bad++;
+            }
+            m.seq = 2;
+            if (ft_ipc_overwrite(q1, &m) != FT_OK)
+            {
+                bad++;
+            }
+            if (ft_ipc_messages_waiting(q1) != 1)
+            {
+                bad++;              /* overwrite must not grow the queue */
+            }
+            if (ft_ipc_receive(q1, &out, FT_NO_WAIT) != FT_OK || out.seq != 2)
+            {
+                bad++;
+            }
+            if (ft_ipc_receive(q1, &out, FT_NO_WAIT) != FT_ERR_TIMEOUT)
+            {
+                bad++;
+            }
+
+            /* The invariant check. After an overwrite the single slot is taken,
+             * so an ordinary send has to be refused - if it succeeds it will
+             * write past the one-slot buffer. This is the failure the first
+             * version of ft_ipc_overwrite() had: it bumped count without
+             * bumping free_slots, leaving a phantom free slot. */
+            m.seq = 3;
+            if (ft_ipc_overwrite(q1, &m) != FT_OK)
+            {
+                bad++;
+            }
+            if (ft_ipc_send(q1, &m, FT_NO_WAIT) != FT_ERR_FULL)
+            {
+                bad++;
+            }
+            if (ft_ipc_spaces_available(q1) != 0)
+            {
+                bad++;              /* no phantom free slot */
+            }
+            if (ft_ipc_receive(q1, &out, FT_NO_WAIT) != FT_OK || out.seq != 3)
+            {
+                bad++;
+            }
+
+            /* peek leaves the item in place, twice. */
+            m.seq = 7;
+            if (ft_ipc_send(q1, &m, FT_NO_WAIT) != FT_OK)
+            {
+                bad++;
+            }
+            if (ft_ipc_peek(q1, &out, FT_NO_WAIT) != FT_OK || out.seq != 7)
+            {
+                bad++;
+            }
+            if (ft_ipc_peek(q1, &out, FT_NO_WAIT) != FT_OK || out.seq != 7)
+            {
+                bad++;
+            }
+            if (ft_ipc_messages_waiting(q1) != 1)
+            {
+                bad++;              /* a peek must not consume */
+            }
+            if (ft_ipc_receive(q1, &out, FT_NO_WAIT) != FT_OK || out.seq != 7)
+            {
+                bad++;
+            }
+
+            /* peek on empty must time out rather than return stale bytes. */
+            if (ft_ipc_peek(q1, &out, FT_NO_WAIT) != FT_ERR_TIMEOUT)
+            {
+                bad++;
+            }
+
+            /* reset empties a queue and restores its capacity. */
+            for (int i = 0; i < 3; i++)
+            {
+                m.seq = 100 + i;
+                if (ft_ipc_send(q3, &m, FT_NO_WAIT) != FT_OK)
+                {
+                    bad++;
+                }
+            }
+            if (ft_ipc_reset(q3) != FT_OK)
+            {
+                bad++;
+            }
+            if (ft_ipc_messages_waiting(q3) != 0 ||
+                ft_ipc_spaces_available(q3) != 3)
+            {
+                bad++;              /* capacity must be intact after a reset */
+            }
+            m.seq = 200;
+            if (ft_ipc_send(q3, &m, FT_NO_WAIT) != FT_OK ||
+                ft_ipc_receive(q3, &out, FT_NO_WAIT) != FT_OK || out.seq != 200)
+            {
+                bad++;              /* usable straight after a reset */
+            }
+
+            /* A length-3 queue must refuse an overwrite, because the semantics
+             * would be ambiguous and FreeRTOS asserts on it. */
+            if (ft_ipc_overwrite(q3, &m) == FT_OK)
+            {
+                bad++;
+            }
+        }
+
+        if (q1) ft_ipc_delete(q1);
+        if (q3) ft_ipc_delete(q3);
+
+        total_bad += bad;
+        st_report("fbshim/ovr", bad == 0,
+                  "overwrite replaces without growing, peek, reset (%d bad)", bad);
+    }
+
     /* ---- 7. blocking with the scheduler locked is refused, not hung ---- */
     bad = 0;
     {

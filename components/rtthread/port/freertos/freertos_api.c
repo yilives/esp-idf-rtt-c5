@@ -109,18 +109,21 @@ BaseType_t xQueueGenericSend(QueueHandle_t xQueue,
                              TickType_t xTicksToWait,
                              const BaseType_t xCopyPosition)
 {
-    /* Only queueSEND_TO_BACK is implemented: the ring in ft_ipc only ever
-     * appends. queueSEND_TO_FRONT and queueOVERWRITE are not linked into this
-     * image (xQueueSendToFront, xQueueOverwrite and xQueueSendToBack all have
-     * zero references in the map), but staying silent about the difference
-     * would turn a future caller's wrong assumption into a data-ordering bug
-     * with no trace. Say so once instead. */
-    if (xCopyPosition != 0)
+    /* queueOVERWRITE now has real semantics rather than a warning: it replaces
+     * the single item instead of appending. queueSEND_TO_FRONT still appends,
+     * because the ring has no way to prepend - and unlike overwrite, a wrong
+     * answer there changes ordering rather than failing loudly, so it warns. */
+    if (xCopyPosition == queueOVERWRITE)
+    {
+        return ft_result(ft_ipc_overwrite((struct ft_ipc *)xQueue, pvItemToQueue));
+    }
+
+    if (xCopyPosition == queueSEND_TO_FRONT)
     {
         static rt_uint32_t warned;
 
         ft_warn_once(&warned,
-                     "xQueueGenericSend: only queueSEND_TO_BACK is supported, "
+                     "xQueueGenericSend: queueSEND_TO_FRONT is not implemented, "
                      "the item was appended");
     }
 
@@ -132,13 +135,19 @@ BaseType_t xQueueGenericSendFromISR(QueueHandle_t xQueue,
                                     BaseType_t *const pxHigherPriorityTaskWoken,
                                     const BaseType_t xCopyPosition)
 {
-    if (xCopyPosition != 0)
+    if (xCopyPosition == queueOVERWRITE)
+    {
+        return ft_result(ft_ipc_overwrite_isr((struct ft_ipc *)xQueue, pvItemToQueue,
+                                              (ft_base_t *)pxHigherPriorityTaskWoken));
+    }
+
+    if (xCopyPosition == queueSEND_TO_FRONT)
     {
         static rt_uint32_t warned;
 
         ft_warn_once(&warned,
-                     "xQueueGenericSendFromISR: only queueSEND_TO_BACK is "
-                     "supported, the item was appended");
+                     "xQueueGenericSendFromISR: queueSEND_TO_FRONT is not "
+                     "implemented, the item was appended");
     }
 
     return ft_result(ft_ipc_send_isr((struct ft_ipc *)xQueue, pvItemToQueue,
@@ -180,9 +189,95 @@ UBaseType_t uxQueueMessagesWaiting(const QueueHandle_t xQueue)
     return (UBaseType_t)ft_ipc_messages_waiting((struct ft_ipc *)xQueue);
 }
 
+UBaseType_t uxQueueMessagesWaitingFromISR(const QueueHandle_t xQueue)
+{
+    /* The count is read under an interrupt lock in ft_ipc_messages_waiting's
+     * callers' world, but it is a plain word here: an ISR that shadows a pending
+     * send by one item is not a problem the API contracts against, and taking a
+     * lock in an ISR to make a diagnostic exact would be worse. */
+    return (UBaseType_t)ft_ipc_messages_waiting((struct ft_ipc *)xQueue);
+}
+
+BaseType_t xQueueIsQueueFullFromISR(const QueueHandle_t xQueue)
+{
+    return (BaseType_t)(ft_ipc_spaces_available((struct ft_ipc *)xQueue) == 0);
+}
+
 UBaseType_t uxQueueSpacesAvailable(const QueueHandle_t xQueue)
 {
     return (UBaseType_t)ft_ipc_spaces_available((struct ft_ipc *)xQueue);
+}
+
+/* xQueuePeek: read the front item without removing it.
+ *
+ * Not used by anything in this image, but it is in queue.h unconditionally and
+ * the implementation is three lines: copy the slot, leave the ring alone. The
+ * index and item_size are read without a lock, which is the same exposure
+ * uxQueueMessagesWaiting has and acceptable for a peek, since the alternative is
+ * a lock in a path that may be called from an ISR. */
+BaseType_t xQueuePeek(QueueHandle_t xQueue, void *const pvBuffer,
+                      TickType_t xTicksToWait)
+{
+    struct ft_ipc *ipc = (struct ft_ipc *)xQueue;
+    int rc;
+
+    if (ipc == NULL)
+    {
+        return pdFALSE;
+    }
+
+    /* Block until something is there, using a zero-length receive into a
+     * throwaway buffer is not possible - that would consume the item. So this
+     * uses the same "wait for availability, then look" shape as a receive, but
+     * with ft_ipc_peek doing the copy. */
+    rc = ft_ipc_peek(ipc, pvBuffer, xTicksToWait);
+
+    return ft_result(rc);
+}
+
+/* xQueueGenericReset: empty the queue and restore its initial state. */
+BaseType_t xQueueGenericReset(QueueHandle_t xQueue, BaseType_t xNewQueue)
+{
+    RT_UNUSED(xNewQueue);       /* RT-Thread's ring starts at zero either way */
+
+    return ft_result(ft_ipc_reset((struct ft_ipc *)xQueue));
+}
+
+/* ------------------------------------------------------------ queue set -- */
+
+/* Only esp_ble_mesh and esp_ble_iso use queue sets, and neither is in this
+ * image. The implementation is real rather than a stub because a stub would turn
+ * "BLE does not work yet" into "BLE hangs at startup with nothing to go on". */
+
+QueueSetHandle_t xQueueCreateSet(const UBaseType_t uxEventQueueLength)
+{
+    return (QueueSetHandle_t)ft_qset_create(uxEventQueueLength);
+}
+
+BaseType_t xQueueAddToSet(QueueSetMemberHandle_t xQueueOrSemaphore,
+                          QueueSetHandle_t xQueueSet)
+{
+    return (BaseType_t)ft_qset_add((void *)xQueueSet,
+                                   (struct ft_ipc *)xQueueOrSemaphore);
+}
+
+BaseType_t xQueueRemoveFromSet(QueueSetMemberHandle_t xQueueOrSemaphore,
+                               QueueSetHandle_t xQueueSet)
+{
+    return (BaseType_t)ft_qset_remove((void *)xQueueSet,
+                                      (struct ft_ipc *)xQueueOrSemaphore);
+}
+
+QueueSetMemberHandle_t xQueueSelectFromSet(QueueSetHandle_t xQueueSet,
+                                           const TickType_t xTicksToWait)
+{
+    return (QueueSetMemberHandle_t)ft_qset_select((void *)xQueueSet,
+                                                  xTicksToWait, NULL);
+}
+
+QueueSetMemberHandle_t xQueueSelectFromSetFromISR(QueueSetHandle_t xQueueSet)
+{
+    return (QueueSetMemberHandle_t)ft_qset_select_isr((void *)xQueueSet, NULL);
 }
 
 void vQueueDelete(QueueHandle_t xQueue)
@@ -238,6 +333,80 @@ BaseType_t xTaskCreatePinnedToCore(TaskFunction_t pxTaskCode,
 TaskHandle_t xTaskGetCurrentTaskHandle(void)
 {
     return (TaskHandle_t)ft_task_self();
+}
+
+/* The per-core variants. Single core here, so both collapse to the plain ones -
+ * but they have to exist, because task.h declares them and a driver written for
+ * a dual-core part will call them. */
+TaskHandle_t xTaskGetCurrentTaskHandleForCore(BaseType_t xCoreID)
+{
+    RT_UNUSED(xCoreID);
+
+    return (TaskHandle_t)ft_task_self();
+}
+
+TaskHandle_t xTaskGetIdleTaskHandleForCore(BaseType_t xCoreID)
+{
+    RT_UNUSED(xCoreID);
+
+    return (TaskHandle_t)ft_task_idle_handle();
+}
+
+void vTaskResume(TaskHandle_t xTaskToResume)
+{
+    /* Resume is not the same as aborting a delay: FreeRTOS has both, and this is
+     * the one that takes a suspended task back to ready without touching
+     * anything the task was waiting on. rt_thread_resume() is exactly that. */
+    (void)ft_task_resume_isr(xTaskToResume, NULL);
+}
+
+/*
+ * xTaskCreateStaticPinnedToCore.
+ *
+ * The caller supplies both the stack and the control block, which means FreeRTOS
+ * expects them to be used in place: StaticTask_t is a 60-byte placeholder whose
+ * only purpose is to be big enough for the real TCB, and rt_thread is larger.
+ *
+ * Writing an rt_thread into a 60-byte StaticTask_t corrupts whatever follows it,
+ * so the static path here refuses unless the caller's block is documented to be
+ * large enough. esp_ble_mesh is the only user and it passes a StaticTask_t, so
+ * this returns NULL and the component reports a create failure instead of
+ * corrupting the heap. Every other static task path in IDF goes through
+ * xTaskCreateStaticPinnedToCoreWithCaps, which allocates its own control block.
+ *
+ * Refusing is not a regression: before this function existed the call did not
+ * link, so the component could not be built at all.
+ */
+TaskHandle_t xTaskCreateStaticPinnedToCore(TaskFunction_t pxTaskCode,
+                                           const char *const pcName,
+                                           const uint32_t ulStackDepth,
+                                           void *const pvParameters,
+                                           UBaseType_t uxPriority,
+                                           StackType_t *const puxStackBuffer,
+                                           StaticTask_t *const pxTaskBuffer,
+                                           const BaseType_t xCoreID)
+{
+    RT_UNUSED(pxTaskCode);
+    RT_UNUSED(pcName);
+    RT_UNUSED(ulStackDepth);
+    RT_UNUSED(pvParameters);
+    RT_UNUSED(uxPriority);
+    RT_UNUSED(puxStackBuffer);
+    RT_UNUSED(pxTaskBuffer);
+    RT_UNUSED(xCoreID);
+
+    _Static_assert(sizeof(StaticTask_t) < sizeof(struct rt_thread),
+                   "this port assumes StaticTask_t cannot hold an rt_thread");
+
+    {
+        static rt_uint32_t warned;
+
+        ft_warn_once(&warned,
+                     "xTaskCreateStaticPinnedToCore: a StaticTask_t is too "
+                     "small for an rt_thread; use the WithCaps variant");
+    }
+
+    return NULL;
 }
 
 TickType_t xTaskGetTickCount(void)
@@ -431,6 +600,15 @@ EventBits_t xEventGroupClearBits(EventGroupHandle_t xEventGroup,
 {
     return (EventBits_t)ft_event_clear_bits((struct ft_event *)xEventGroup,
                                             (rt_uint32_t)uxBitsToClear);
+}
+
+/* Only the ISR variant is a real function: plain xEventGroupGetBits is a macro
+ * over xEventGroupClearBits(group, 0) in event_groups.h, so defining it here
+ * would be a redefinition error - the same trap xTaskCreate and xTaskNotify set.
+ * The read is one word, so no lock is needed. */
+EventBits_t xEventGroupGetBitsFromISR(EventGroupHandle_t xEventGroup)
+{
+    return (EventBits_t)ft_event_get_bits((struct ft_event *)xEventGroup);
 }
 
 EventBits_t xEventGroupWaitBits(EventGroupHandle_t xEventGroup,
