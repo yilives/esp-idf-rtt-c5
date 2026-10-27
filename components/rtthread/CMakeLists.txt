@@ -61,6 +61,8 @@ set(kernel_srcs
     "${RTTHREAD_ROOT}/src/clock.c"
     "${RTTHREAD_ROOT}/src/cpu_up.c"
     "${RTTHREAD_ROOT}/src/defunct.c"
+    # RT-Thread 5.x moved the device framework out of src/ into the driver tree.
+    "${RTTHREAD_ROOT}/components/drivers/core/device.c"
     "${RTTHREAD_ROOT}/src/idle.c"
     "${RTTHREAD_ROOT}/src/ipc.c"
     "${RTTHREAD_ROOT}/src/irq.c"
@@ -116,6 +118,15 @@ set(finsh_srcs
     "${RTTHREAD_ROOT}/components/finsh/msh_parse.c"
     "${RTTHREAD_ROOT}/components/finsh/cmd.c")
 
+# Serial framework, v1. dev_serial.c is the only file needed: the tty half is
+# behind RT_USING_SMART, and bypass/DMA are optional.
+# completion_* moved to components/drivers/ipc/ in 5.x; dev_serial.c needs
+# rt_completion_wait/init/done for its TX path. Single core -> completion_up.c.
+set(serial_srcs
+    "${RTTHREAD_ROOT}/components/drivers/serial/dev_serial.c"
+    "${RTTHREAD_ROOT}/components/drivers/ipc/completion_up.c"
+    "${RTTHREAD_ROOT}/components/drivers/ipc/completion_comm.c")
+
 if(CONFIG_IDF_TARGET_ESP32C3)
     set(target_srcs
         "port/esp32c3/cpuport.c"
@@ -130,14 +141,15 @@ elseif(CONFIG_IDF_TARGET_ESP32C6)
 elseif(CONFIG_IDF_TARGET_ESP32S31)
     set(target_srcs
         "port/esp32s31/cpuport.c"
-        "port/esp32s31/interrupt.c")
+        "port/esp32s31/interrupt.c"
+        "port/esp32s31/serial.c")
     set(rtt_config_dir "${CMAKE_CURRENT_LIST_DIR}/port/esp32s31")
 endif()
 
 # These flags are applied identically on both targets: the kernel, the shared
 # stack adapter, the context assembly and the CPU port. port/common/board.c
 # keeps the component defaults because it calls into IDF.
-set_source_files_properties(${kernel_srcs} ${common_srcs} ${target_srcs} PROPERTIES
+set_source_files_properties(${kernel_srcs} ${common_srcs} ${target_srcs} ${serial_srcs} PROPERTIES
     COMPILE_DEFINITIONS "__RTTHREAD__;__RT_KERNEL_SOURCE__"
     COMPILE_OPTIONS "-ffreestanding;-fno-builtin")
 
@@ -147,12 +159,13 @@ set_source_files_properties(${finsh_srcs} PROPERTIES
     COMPILE_DEFINITIONS "__RTTHREAD__;__RT_KERNEL_SOURCE__"
     COMPILE_OPTIONS "-ffreestanding;-fno-builtin;-Wno-cast-function-type")
 
-set(srcs ${kernel_srcs} ${common_srcs} ${target_srcs} ${finsh_srcs} "port/common/board.c")
+set(srcs ${kernel_srcs} ${common_srcs} ${target_srcs} ${finsh_srcs} ${serial_srcs} "port/common/board.c")
 
 idf_component_register(SRCS ${srcs}
     # Upstream headers first, then this component's per-target config directory
     # (rtconfig.h) and cpuport.h / rt_hw_stack_frame.h from upstream libcpu.
-    INCLUDE_DIRS "${RTTHREAD_ROOT}/include" "${RTTHREAD_ROOT}/components/finsh" "${rtt_config_dir}"
+    INCLUDE_DIRS "${RTTHREAD_ROOT}/include" "${RTTHREAD_ROOT}/components/finsh"
+                 "${RTTHREAD_ROOT}/components/drivers/include" "${rtt_config_dir}"
     PRIV_INCLUDE_DIRS "${rtt_riscv_port_dir}" "${IDF_PATH}/components/freertos"
     PRIV_REQUIRES freertos riscv
     LDFRAGMENTS "linker.lf")
@@ -161,7 +174,7 @@ idf_component_register(SRCS ${srcs}
 # registered earlier (startup, the FreeRTOS tick/port adapters, and applications).
 # rtconfig.h must stay globally visible because those include <rtthread.h>.
 idf_build_set_property(INCLUDE_DIRECTORIES
-    "${RTTHREAD_ROOT}/include;${RTTHREAD_ROOT}/components/finsh;${rtt_config_dir}" APPEND)
+    "${RTTHREAD_ROOT}/include;${RTTHREAD_ROOT}/components/finsh;${RTTHREAD_ROOT}/components/drivers/include;${rtt_config_dir}" APPEND)
 idf_build_set_property(COMPILE_DEFINITIONS RT_USING_USER_MAIN APPEND)
 # RT-Thread invokes the application's main from a kernel archive. Keep that
 # entry point regardless of the component archive order (as IDF does for app_main).
@@ -170,5 +183,11 @@ target_link_libraries(${COMPONENT_LIB} INTERFACE "-u main")
 # is referenced, so the linker would drop the archive members and the .rti_fn
 # table would hold nothing but its boundary markers. Force the entry point in.
 target_link_libraries(${COMPONENT_LIB} INTERFACE "-u finsh_system_init")
+if(CONFIG_IDF_TARGET_ESP32S31)
+    # Same archive-ordering problem: the application calls rt_hw_uart0_init()
+    # but libmain.a is scanned after librtthread.a, so the member would never be
+    # pulled in. -u plants the undefined reference before the archive is read.
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_uart0_init")
+endif()
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     RT_MAIN_THREAD_STACK_SIZE=CONFIG_ESP_MAIN_TASK_STACK_SIZE)

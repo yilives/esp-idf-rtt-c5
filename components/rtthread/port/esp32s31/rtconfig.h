@@ -44,6 +44,16 @@
 #define RT_USING_SEMAPHORE
 #define RT_USING_MUTEX
 
+/* Device framework + serial v1.
+ *
+ * src/device.c is part of this component's kernel source list, and
+ * components/drivers/serial/dev_serial.c supplies rt_hw_serial_register().
+ * Only the v1 API is used: the tty/posix half needs RT_USING_SMART. */
+#define RT_USING_DEVICE
+#define RT_USING_SERIAL
+#define RT_USING_SERIAL_V1
+#define RT_SERIAL_RB_BUFSZ              64
+
 /* Console and shell.
  *
  * RT_USING_DEVICE stays off for now, which is why finsh takes the
