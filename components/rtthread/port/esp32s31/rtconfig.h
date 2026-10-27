@@ -44,22 +44,25 @@
 #define RT_USING_SEMAPHORE
 #define RT_USING_MUTEX
 
-/* Device framework + serial v1.
+/* Device framework + serial v1 + pin.
  *
- * src/device.c is part of this component's kernel source list, and
- * components/drivers/serial/dev_serial.c supplies rt_hw_serial_register().
- * Only the v1 API is used: the tty/posix half needs RT_USING_SMART. */
+ * components/drivers/core/device.c is part of this component's kernel source
+ * list, components/drivers/serial/dev_serial.c supplies
+ * rt_hw_serial_register(), and port/esp32s31/gpio.c registers the "pin"
+ * device. Only the v1 serial API is used: the tty/posix half needs
+ * RT_USING_SMART.
+ *
+ * With RT_USING_DEVICE on, finsh switches from rt_hw_console_getchar() to
+ * reading a console device (components/finsh/shell.c), which is why main()
+ * binds the shell to "uart0".
+ */
 #define RT_USING_DEVICE
 #define RT_USING_SERIAL
 #define RT_USING_SERIAL_V1
 #define RT_SERIAL_RB_BUFSZ              64
+#define RT_USING_PIN
 
 /* Console and shell.
- *
- * RT_USING_DEVICE stays off for now, which is why finsh takes the
- * rt_hw_console_getchar() path (components/finsh/shell.c:210) instead of
- * reading from a console device. That keeps P2 free of the device framework
- * and of src/device.c, which this component does not compile yet.
  *
  * FINSH_USING_SYMTAB needs __fsymtab_start/__fsymtab_end and the .rti_fn*
  * table; both are emitted by esp32s31/sections.ld.in under

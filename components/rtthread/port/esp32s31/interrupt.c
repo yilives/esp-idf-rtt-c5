@@ -23,13 +23,23 @@
  *    must call esp_intr_alloc() with an ETS_*_INTR_SOURCE and pass
  *    rtt_trampoline() plus their own context; this file's install API is for
  *    the single-owner case and for lines already routed by IDF/ROM.
+ *
+ * 4. Routing. Installing a handler is only step 2 of the four-step sequence
+ *    in esp_rom_sys.h. Every INTERRUPT_CORE0_*_MAP register resets to 0, so
+ *    the matrix starts with all sources on CPU line 0. rt_hw_intr_route()
+ *    performs step 1; without it the handler is never reached and the only
+ *    visible symptom is a peripheral that stays silent.
  */
 
 #include <rthw.h>
 #include <rtthread.h>
 
 #include "soc/soc_caps.h"
+#include "soc/interrupts.h"
 #include "riscv/interrupt.h"
+#include "esp_rom_sys.h"
+
+#include "port_intr.h"
 
 /* ETS INUM range. Slot arithmetic lives in the assembly, not here. */
 #define RTT_INUM_NUM        SOC_CPU_INTR_NUM
@@ -102,6 +112,24 @@ void rt_hw_interrupt_uninstall(int vector, rt_isr_handler_t handler, void *param
         s_ctx[vector] = (struct rtt_isr_ctx){ RT_NULL, RT_NULL, vector };
         intr_handler_set(vector, RT_NULL, RT_NULL);
     }
+}
+
+int rt_hw_intr_route(int source, int inum)
+{
+    if (source < 0 || source >= ETS_MAX_INTR_SOURCE ||
+        inum   < 0 || inum   >= RTT_INUM_NUM)
+    {
+        rt_kprintf("intr: bad route source=%d inum=%d (0..%d / 0..%d)\n",
+                   source, inum, ETS_MAX_INTR_SOURCE - 1, RTT_INUM_NUM - 1);
+        return -RT_EINVAL;
+    }
+
+    /* cpu_intr_num is the external interrupt number: the ROM adds
+     * RV_EXTERNAL_INT_OFFSET itself, so the CLIC slot becomes inum + 16 and
+     * _global_interrupt_handler() recovers it as mcause - 16. */
+    esp_rom_route_intr_matrix(0, (uint32_t)source, (uint32_t)inum);
+
+    return 0;
 }
 
 void rt_hw_interrupt_mask(int vector)

@@ -16,4 +16,14 @@ void rt_hw_board_init(void)
      */
     vPortSetupTimer();
     esprv_int_set_threshold(RVHAL_INTR_ENABLE_THRESH);
+
+#if defined(SOC_ESP32_S31)
+    /* Register the pin device before the scheduler runs so anything that uses
+     * rt_pin_*() during init finds it. Also the only reference that keeps the
+     * GPIO driver object from being dropped out of the component archive:
+     * rt_device_pin_register() lives in the drivers archive, not here. */
+    extern int rt_hw_pin_init(void);
+
+    rt_hw_pin_init();
+#endif
 }

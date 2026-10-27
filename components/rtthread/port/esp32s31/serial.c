@@ -8,10 +8,13 @@
  * and then hangs. Everything below touches registers only.
  *
  * UART0 is left exactly as the ROM console configured it: baud rate, frame
- * format, pin mux and the interrupt-matrix route to ETS_UART0_INUM are all
- * inherited. Re-programming them needs the clock-tree work (uart_ll_set_baudrate
- * wants the APB frequency, the pins need the GPIO matrix) which is a later step;
- * until then configure() only records the request.
+ * format and pin mux are all inherited. What is NOT inherited is the interrupt
+ * matrix route - every INTERRUPT_CORE0_*_MAP register resets to 0 - so
+ * init explicitly routes ETS_UART0_INTR_SOURCE onto ETS_UART0_INUM. Without
+ * that the handler installs fine and then never runs. Re-programming the baud
+ * rate needs the clock-tree work (uart_ll_set_baudrate wants the APB frequency,
+ * the pins need the GPIO matrix) which is a later step; until then configure()
+ * only records the request.
  */
 
 #include <rthw.h>
@@ -21,8 +24,10 @@
 #include "soc/soc.h"
 #include "soc/uart_struct.h"
 #include "soc/uart_reg.h"
+#include "soc/interrupts.h"
 #include "hal/uart_ll.h"
 
+#include "port_intr.h"
 #include "port_serial.h"
 
 /* RX timeout in bit times: raise an interrupt for a short burst instead of
@@ -148,8 +153,15 @@ int rt_hw_uart0_init(void)
         return -RT_ERROR;
     }
 
-    /* Register before anything opens the device: open() enables the UART
-     * interrupt and unmasks the line, so the handler must already be in place. */
+    /* Step 1 of four: put UART0 on its own CPU line. The matrix resets to 0,
+     * so UART0 would otherwise raise CPU interrupt 0 while the handler below
+     * sits on line 5 - an install that silently never fires.
+     * Step 2: install the handler. Steps 3 and 4 (unmask the line, enable the
+     * peripheral interrupt) happen when the device is opened, see control(). */
+    if (rt_hw_intr_route(ETS_UART0_INTR_SOURCE, ETS_UART0_INUM) != 0)
+    {
+        return -RT_ERROR;
+    }
     rt_hw_interrupt_install(ETS_UART0_INUM, s31_uart_isr, RT_NULL, "uart0");
 
     return 0;

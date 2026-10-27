@@ -122,8 +122,11 @@ set(finsh_srcs
 # behind RT_USING_SMART, and bypass/DMA are optional.
 # completion_* moved to components/drivers/ipc/ in 5.x; dev_serial.c needs
 # rt_completion_wait/init/done for its TX path. Single core -> completion_up.c.
+# dev_pin.c provides rt_device_pin_register() and the rt_pin_* wrappers that
+# port/esp32s31/gpio.c plugs its rt_pin_ops into.
 set(serial_srcs
     "${RTTHREAD_ROOT}/components/drivers/serial/dev_serial.c"
+    "${RTTHREAD_ROOT}/components/drivers/pin/dev_pin.c"
     "${RTTHREAD_ROOT}/components/drivers/ipc/completion_up.c"
     "${RTTHREAD_ROOT}/components/drivers/ipc/completion_comm.c")
 
@@ -142,7 +145,8 @@ elseif(CONFIG_IDF_TARGET_ESP32S31)
     set(target_srcs
         "port/esp32s31/cpuport.c"
         "port/esp32s31/interrupt.c"
-        "port/esp32s31/serial.c")
+        "port/esp32s31/serial.c"
+        "port/esp32s31/gpio.c")
     set(rtt_config_dir "${CMAKE_CURRENT_LIST_DIR}/port/esp32s31")
 endif()
 
@@ -153,9 +157,11 @@ set_source_files_properties(${kernel_srcs} ${common_srcs} ${target_srcs} ${seria
     COMPILE_DEFINITIONS "__RTTHREAD__;__RT_KERNEL_SOURCE__"
     COMPILE_OPTIONS "-ffreestanding;-fno-builtin")
 
-# finsh stores commands as `long (*)(void)` and casts to the real prototype at
-# call time; that is the upstream design and trips -Werror=cast-function-type.
-set_source_files_properties(${finsh_srcs} PROPERTIES
+# rtthread.h pulls in finsh.h whenever RT_USING_FINSH is set, and finsh.h stores
+# commands as `long (*)(void)` and casts to the real prototype at call time.
+# Any driver that exports an msh command therefore trips
+# -Werror=cast-function-type: that is the upstream design, not a local bug.
+set_source_files_properties(${finsh_srcs} ${serial_srcs} PROPERTIES
     COMPILE_DEFINITIONS "__RTTHREAD__;__RT_KERNEL_SOURCE__"
     COMPILE_OPTIONS "-ffreestanding;-fno-builtin;-Wno-cast-function-type")
 
@@ -167,7 +173,7 @@ idf_component_register(SRCS ${srcs}
     INCLUDE_DIRS "${RTTHREAD_ROOT}/include" "${RTTHREAD_ROOT}/components/finsh"
                  "${RTTHREAD_ROOT}/components/drivers/include" "${rtt_config_dir}"
     PRIV_INCLUDE_DIRS "${rtt_riscv_port_dir}" "${IDF_PATH}/components/freertos"
-    PRIV_REQUIRES freertos riscv
+    PRIV_REQUIRES freertos riscv esp_rom soc hal esp_hal_uart esp_hal_gpio
     LDFRAGMENTS "linker.lf")
 
 # IDF applies these properties via generator expressions, including to components
