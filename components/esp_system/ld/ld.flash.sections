@@ -108,6 +108,36 @@
     *(.gcc_except_table .gcc_except_table.*)
     *(.gnu.linkonce.e.*)
 
+    /* RT-Thread's shell command table and auto-init callbacks.
+     *
+     * These have to live inside a loadable PROGBITS section, and that is not a
+     * stylistic preference. SOC_MMU_DI_VADDR_SHARED chips (esp32c6, esp32s31)
+     * map exactly two segments from flash, and the bootloader asserts it:
+     *
+     *     assert(rom_index < 2);          bootloader_utility.c:833
+     *
+     * A separate .flash.rt_thread section placed after the NOLOAD sections
+     * becomes a third one - NOBITS occupies no file space, so the linker has to
+     * open a new load segment to continue with PROGBITS. The image then fails to
+     * boot with "Assert failed in unpack_load_app (rom_index < 2)" after the
+     * bootloader has already printed "Loaded app from partition".
+     *
+     * Putting them here keeps the count at two: one text segment, one rodata.
+     * The linker can still garbage-collect individual entries, because KEEP()
+     * is what pins the start and end symbols, not the placement. */
+    . = ALIGN(8);
+    __fsymtab_start = .;
+    KEEP(*(FSymTab))
+    __fsymtab_end = .;
+    . = ALIGN(8);
+    __vsymtab_start = .;
+    KEEP(*(VSymTab))
+    __vsymtab_end = .;
+    . = ALIGN(4);
+    __rt_init_start = .;
+    KEEP(*(SORT(.rti_fn*)))
+    __rt_init_end = .;
+
     . = ALIGN(ALIGNOF(.flash.init_array));
   } > flash_rodata_seg
   ASSERT_SECTIONS_GAP(.flash.rodata, .flash.init_array)

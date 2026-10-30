@@ -56,6 +56,10 @@ struct ft_ipc
      * the caller's own block back for it to free. */
     void       *static_cb;
 
+    /* Set when the caller's static control block holds a stub pointing here, so
+     * deleting the object must also clear that stub. */
+    rt_uint8_t  has_stub;
+
     /* The queue set this queue belongs to, or NULL. FreeRTOS requires that a
      * queue be empty when it is added to a set, and the set is notified on every
      * successful send - that notification is what xQueueSelectFromSet() waits
@@ -81,6 +85,16 @@ rt_size_t ft_ipc_size(void)
 {
     return sizeof(struct ft_ipc);
 }
+
+/* The stub, not the object, has to fit in the caller's control block; the other
+ * half of that check lives in freertos_api.c where StaticQueue_t is in scope. */
+_Static_assert(sizeof(struct ft_ipc_stub) <= 16,
+               "the stub is meant to be small enough for any StaticQueue_t");
+
+/* The size is exported rather than asserted here because this file must not
+ * include the FreeRTOS headers - that separation is what keeps it reusable. The
+ * one place the comparison matters is freertos_api.c, which has StaticQueue_t
+ * in scope and does the check with a static assert. */
 
 /*
  * Refuse to block when the RT-Thread scheduler is locked, or from an ISR.
@@ -236,6 +250,114 @@ struct ft_ipc *ft_ipc_create_static(ft_ubase_t length, ft_ubase_t item_size,
                        length, item_size, (rt_uint8_t *)storage, RT_FALSE);
 }
 
+/* ------------------------------------------------------------------ stub -- */
+
+/*
+ * Static handles as stubs.
+ *
+ * FreeRTOS's static creation functions return the caller's control block as the
+ * handle, and callers depend on it - esp_libc asserts
+ *
+ *     assert(handle == (SemaphoreHandle_t) &s_common_mutex);   locks.c:422
+ *
+ * The object cannot go inside that block: StaticQueue_t is a placeholder sized
+ * for FreeRTOS's own TCB (~60 bytes) while a queue here needs two RT-Thread
+ * semaphores plus a mutex (~180). Placing it anyway would overrun the caller's
+ * memory by more than 100 bytes.
+ *
+ * So the block gets a two-word stub and the real object lives on the heap. Every
+ * API entry passes the handle through ft_ipc_resolve(), which follows the stub
+ * only when the magic matches - a real struct ft_ipc starts with three one-byte
+ * flags, so its first word cannot be FT_IPC_MAGIC by accident.
+ */
+
+struct ft_ipc *ft_ipc_resolve(void *handle)
+{
+    struct ft_ipc_stub *stub;
+
+    if (handle == RT_NULL)
+    {
+        return RT_NULL;
+    }
+
+    stub = (struct ft_ipc_stub *)handle;
+
+    if (stub->magic == FT_IPC_MAGIC)
+    {
+        return stub->real;
+    }
+
+    return (struct ft_ipc *)handle;
+}
+
+static struct ft_ipc *ft_ipc_stub_finish(struct ft_ipc *real, void *cb)
+{
+    struct ft_ipc_stub *stub = (struct ft_ipc_stub *)cb;
+
+    stub->magic = FT_IPC_MAGIC;
+    stub->real  = real;
+
+    real->static_cb = cb;
+    real->has_stub  = 1;
+
+    /* The handle is the caller's block, not the object - that is the point of the
+     * stub. Callers keep using the pointer they passed in. */
+    return (struct ft_ipc *)cb;
+}
+
+struct ft_ipc *ft_ipc_create_stub(ft_ubase_t length, ft_ubase_t item_size,
+                                  void *storage, void *cb, rt_uint32_t cb_size)
+{
+    struct ft_ipc *q;
+
+    if (cb == RT_NULL || length == 0 ||
+        cb_size < sizeof(struct ft_ipc_stub))
+    {
+        return RT_NULL;
+    }
+
+    q = rt_malloc(sizeof(*q));
+    if (q == RT_NULL)
+    {
+        return RT_NULL;
+    }
+
+    if (ft_ipc_init(q, item_size ? FT_IPC_KIND_QUEUE : FT_IPC_KIND_SEM,
+                    length, item_size, (rt_uint8_t *)storage, RT_FALSE) == RT_NULL)
+    {
+        rt_free(q);
+        return RT_NULL;
+    }
+
+    return ft_ipc_stub_finish(q, cb);
+}
+
+struct ft_ipc *ft_ipc_create_mutex_stub(void *cb, rt_uint32_t cb_size,
+                                        ft_base_t recursive)
+{
+    struct ft_ipc *q;
+
+    if (cb == RT_NULL || cb_size < sizeof(struct ft_ipc_stub))
+    {
+        return RT_NULL;
+    }
+
+    q = rt_malloc(sizeof(*q));
+    if (q == RT_NULL)
+    {
+        return RT_NULL;
+    }
+
+    if (ft_ipc_init(q, recursive ? FT_IPC_KIND_RECMUTEX : FT_IPC_KIND_MUTEX,
+                    1, 0, RT_NULL, RT_FALSE) == RT_NULL)
+    {
+        rt_free(q);
+        return RT_NULL;
+    }
+
+    return ft_ipc_stub_finish(q, cb);
+}
+
 struct ft_ipc *ft_ipc_create_static_ram(ft_ubase_t length, ft_ubase_t item_size,
                                         void *storage, void *cb)
 {
@@ -266,6 +388,7 @@ struct ft_ipc *ft_ipc_create_static_ram(ft_ubase_t length, ft_ubase_t item_size,
 
 void *ft_ipc_static_cb(struct ft_ipc *ipc)
 {
+    ipc = ft_ipc_resolve(ipc);
     return (ipc != RT_NULL) ? ipc->static_cb : RT_NULL;
 }
 
@@ -293,6 +416,7 @@ struct ft_ipc *ft_ipc_create_mutex_static(void *cb, ft_base_t recursive)
 
 void *ft_ipc_storage(struct ft_ipc *ipc)
 {
+    ipc = ft_ipc_resolve(ipc);
     return (ipc != RT_NULL) ? ipc->buf : RT_NULL;
 }
 
@@ -344,6 +468,7 @@ struct ft_ipc *ft_ipc_create_mutex(void)
 
 void *ft_ipc_mutex_holder(struct ft_ipc *ipc)
 {
+    ipc = ft_ipc_resolve(ipc);
     if (ipc == RT_NULL)
     {
         return RT_NULL;
@@ -364,6 +489,7 @@ void *ft_ipc_mutex_holder(struct ft_ipc *ipc)
 
 void ft_ipc_delete(struct ft_ipc *ipc)
 {
+    ipc = ft_ipc_resolve(ipc);
     if (ipc == RT_NULL)
     {
         return;
@@ -391,10 +517,23 @@ void ft_ipc_delete(struct ft_ipc *ipc)
         }
         rt_free(ipc);
     }
+    else if (ipc->has_stub)
+    {
+        /* The handle the caller holds is its own control block, so the stub has
+         * to be cleared before the object disappears - otherwise the next call
+         * through that handle dereferences freed memory. The block itself
+         * belongs to the caller and is left allocated. */
+        if (ipc->static_cb != RT_NULL)
+        {
+            rt_memset(ipc->static_cb, 0, sizeof(struct ft_ipc_stub));
+        }
+        ipc->has_stub = 0;
+        rt_free(ipc);
+    }
     else if (ipc->static_cb != RT_NULL)
     {
-        /* Object is ours, the storage and control block belong to the caller.
-         * vQueueDeleteWithCaps() frees those two itself. */
+        /* Heap object, caller's storage and control block. vQueueDeleteWithCaps()
+         * frees those two itself, so only the object goes here. */
         ipc->static_cb = RT_NULL;
         rt_free(ipc);
     }
@@ -439,6 +578,7 @@ static void ft_ipc_pop(struct ft_ipc *q, void *item)
 
 int ft_ipc_send(struct ft_ipc *ipc, const void *item, ft_tick_t ticks)
 {
+    ipc = ft_ipc_resolve(ipc);
     if (ipc == RT_NULL)
     {
         return FT_ERR_PARAM;
@@ -483,6 +623,7 @@ int ft_ipc_send(struct ft_ipc *ipc, const void *item, ft_tick_t ticks)
 
 int ft_ipc_send_isr(struct ft_ipc *ipc, const void *item, ft_base_t *woken)
 {
+    ipc = ft_ipc_resolve(ipc);
     if (woken != RT_NULL)
     {
         *woken = ftFAIL;
@@ -547,6 +688,7 @@ static int ft_ipc_take_item(struct ft_ipc *ipc, void *item, ft_tick_t ticks)
 
 int ft_ipc_receive(struct ft_ipc *ipc, void *item, ft_tick_t ticks)
 {
+    ipc = ft_ipc_resolve(ipc);
     if (ipc == RT_NULL ||
         ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX)
     {
@@ -558,6 +700,7 @@ int ft_ipc_receive(struct ft_ipc *ipc, void *item, ft_tick_t ticks)
 
 int ft_ipc_receive_isr(struct ft_ipc *ipc, void *item, ft_base_t *woken)
 {
+    ipc = ft_ipc_resolve(ipc);
     if (woken != RT_NULL)
     {
         *woken = ftFAIL;
@@ -587,9 +730,28 @@ int ft_ipc_receive_isr(struct ft_ipc *ipc, void *item, ft_base_t *woken)
 
 int ft_ipc_take(struct ft_ipc *ipc, ft_tick_t ticks)
 {
+    ipc = ft_ipc_resolve(ipc);
     if (ipc == RT_NULL)
     {
         return FT_ERR_PARAM;
+    }
+
+    /* Before the scheduler starts there is no thread to own a mutex, and
+     * rt_mutex_take() dereferences rt_thread_self() without checking
+     * (src/ipc.c:1353, `thread->error = RT_EOK`). FreeRTOS's own contract for
+     * this window is that locking is a no-op - esp_libc relies on it
+     * (locks.c:128) - so the mutex kinds report success without touching the
+     * RT-Thread object. Queue and semaphore operations still work, because
+     * rt_sem_trytake() does not need a thread.
+     *
+     * This is not hypothetical: mbedtls's PSA init at the SECONDARY stage takes
+     * its global mutex through pthread, and without this the CPU takes a store
+     * fault at address 44 - offsetof(struct rt_thread, error) from a NULL base.
+     */
+    if ((ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX) &&
+        rt_thread_self() == RT_NULL)
+    {
+        return FT_OK;
     }
 
     if (ipc->kind == FT_IPC_KIND_RECMUTEX)
@@ -619,8 +781,18 @@ int ft_ipc_take(struct ft_ipc *ipc, ft_tick_t ticks)
     {
         rt_thread_t self = rt_thread_self();
 
-        /* FreeRTOS would deadlock here; failing is the only useful answer. */
-        if (ipc->owner == self)
+        /* FreeRTOS would deadlock here; failing is the only useful answer.
+         *
+         * `owner != RT_NULL` is load-bearing, not defensive. Before the
+         * scheduler starts rt_thread_self() returns NULL, and so does an
+         * unowned mutex - so a bare `owner == self` comparison says "you
+         * already hold this" for every mutex in the system. That is exactly
+         * what happened on the first boot: mbedtls's PSA initialisation runs at
+         * the SECONDARY stage, takes its global mutex through pthread, got
+         * FT_ERR_TIMEOUT, and psa_crypto_init() reported
+         * PSA_ERROR_SERVICE_FAILURE (-144) - which cpu_start then treated as a
+         * fatal init failure. */
+        if (ipc->owner != RT_NULL && ipc->owner == self)
         {
             return FT_ERR_TIMEOUT;
         }
@@ -655,9 +827,17 @@ int ft_ipc_take(struct ft_ipc *ipc, ft_tick_t ticks)
 
 int ft_ipc_give(struct ft_ipc *ipc)
 {
+    ipc = ft_ipc_resolve(ipc);
     if (ipc == RT_NULL)
     {
         return FT_ERR_PARAM;
+    }
+
+    /* The matching half of the pre-scheduler no-op in ft_ipc_take(). */
+    if ((ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX) &&
+        rt_thread_self() == RT_NULL)
+    {
+        return FT_OK;
     }
 
     if (ipc->kind == FT_IPC_KIND_RECMUTEX)
@@ -686,6 +866,7 @@ int ft_ipc_give(struct ft_ipc *ipc)
 
 int ft_ipc_give_isr(struct ft_ipc *ipc, ft_base_t *woken)
 {
+    ipc = ft_ipc_resolve(ipc);
     if (ipc != RT_NULL &&
         (ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX))
     {
@@ -702,6 +883,7 @@ int ft_ipc_give_isr(struct ft_ipc *ipc, ft_base_t *woken)
 
 ft_base_t ft_ipc_is_empty(struct ft_ipc *ipc)
 {
+    ipc = ft_ipc_resolve(ipc);
     if (ipc == RT_NULL)
     {
         return ftPASS;
@@ -712,6 +894,7 @@ ft_base_t ft_ipc_is_empty(struct ft_ipc *ipc)
 
 ft_ubase_t ft_ipc_messages_waiting(struct ft_ipc *ipc)
 {
+    ipc = ft_ipc_resolve(ipc);
     if (ipc == RT_NULL ||
         ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX)
     {
@@ -723,6 +906,7 @@ ft_ubase_t ft_ipc_messages_waiting(struct ft_ipc *ipc)
 
 ft_ubase_t ft_ipc_spaces_available(struct ft_ipc *ipc)
 {
+    ipc = ft_ipc_resolve(ipc);
     if (ipc == RT_NULL ||
         ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX)
     {
@@ -751,6 +935,7 @@ ft_ubase_t ft_ipc_spaces_available(struct ft_ipc *ipc)
  */
 int ft_ipc_overwrite(struct ft_ipc *ipc, const void *item)
 {
+    ipc = ft_ipc_resolve(ipc);
     rt_base_t level;
     rt_bool_t was_empty;
 
@@ -822,6 +1007,7 @@ int ft_ipc_overwrite(struct ft_ipc *ipc, const void *item)
 
 int ft_ipc_overwrite_isr(struct ft_ipc *ipc, const void *item, ft_base_t *woken)
 {
+    ipc = ft_ipc_resolve(ipc);
     int rc = ft_ipc_overwrite(ipc, item);
 
     /* rt_sem_release() inside has already made a waiting receiver ready; the
@@ -853,6 +1039,7 @@ int ft_ipc_overwrite_isr(struct ft_ipc *ipc, const void *item, ft_base_t *woken)
  */
 int ft_ipc_peek(struct ft_ipc *ipc, void *item, ft_tick_t ticks)
 {
+    ipc = ft_ipc_resolve(ipc);
     rt_uint32_t elapsed = 0;
 
     if (ipc == RT_NULL || item == RT_NULL ||
@@ -920,6 +1107,7 @@ int ft_ipc_peek(struct ft_ipc *ipc, void *item, ft_tick_t ticks)
  */
 int ft_ipc_reset(struct ft_ipc *ipc)
 {
+    ipc = ft_ipc_resolve(ipc);
     rt_base_t level;
 
     if (ipc == RT_NULL ||
@@ -946,6 +1134,7 @@ int ft_ipc_reset(struct ft_ipc *ipc)
  * is private to this file on purpose, and one pointer is all ft_qset.c needs. */
 void ft_ipc_set_membership(struct ft_ipc *ipc, void *set)
 {
+    ipc = ft_ipc_resolve(ipc);
     if (ipc != RT_NULL)
     {
         ipc->set = set;
@@ -954,5 +1143,6 @@ void ft_ipc_set_membership(struct ft_ipc *ipc, void *set)
 
 void *ft_ipc_get_membership(struct ft_ipc *ipc)
 {
+    ipc = ft_ipc_resolve(ipc);
     return (ipc != RT_NULL) ? ipc->set : RT_NULL;
 }

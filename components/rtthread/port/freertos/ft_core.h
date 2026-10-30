@@ -131,6 +131,46 @@ struct ft_ipc *ft_ipc_create_static_ram(ft_ubase_t length, ft_ubase_t item_size,
  */
 struct ft_ipc *ft_ipc_create_mutex_static(void *cb, ft_base_t recursive);
 
+/*
+ * Static creation that puts the object inside the caller's control block, so the
+ * returned handle equals the pointer the caller passed - which is what FreeRTOS
+ * promises and what esp_libc asserts (locks.c:422). Falls back to a heap object
+ * when the block is too small, warning once.
+ */
+/*
+ * Static handles: a stub in the caller's block, the real object on the heap.
+ *
+ * FreeRTOS's static creation functions promise that the handle equals the
+ * control block the caller supplied, and callers rely on it - esp_libc does
+ *
+ *     handle = xSemaphoreCreateMutexStatic(&s_common_mutex);
+ *     assert(handle == (SemaphoreHandle_t) &s_common_mutex);   locks.c:422
+ *
+ * The object cannot be placed inside the block: StaticQueue_t is a placeholder
+ * sized for FreeRTOS's own TCB (about 60 bytes) while a queue here needs two
+ * RT-Thread semaphores and a mutex (about 180). So the block holds a stub that
+ * points at the real object, and every API entry resolves the handle before
+ * using it.
+ *
+ * The magic is what makes resolution safe: a real struct ft_ipc starts with
+ * three one-byte flags, so its first word can never equal FT_IPC_MAGIC.
+ */
+#define FT_IPC_MAGIC            0x46544950u     /* "FTIP" */
+
+struct ft_ipc_stub
+{
+    rt_uint32_t    magic;
+    struct ft_ipc *real;
+};
+
+struct ft_ipc *ft_ipc_resolve(void *handle);
+
+/** Static creation via a stub. Returns the caller's block as the handle. */
+struct ft_ipc *ft_ipc_create_stub(ft_ubase_t length, ft_ubase_t item_size,
+                                  void *storage, void *cb, rt_uint32_t cb_size);
+struct ft_ipc *ft_ipc_create_mutex_stub(void *cb, rt_uint32_t cb_size,
+                                        ft_base_t recursive);
+
 /** The control block passed to ft_ipc_create_static_ram(), or NULL. */
 void *ft_ipc_static_cb(struct ft_ipc *ipc);
 
@@ -266,6 +306,17 @@ ft_ubase_t ft_prio_to_ft(rt_uint8_t prio);
  *                    takes bytes
  * @param handle      receives the thread, may be NULL
  */
+/*
+ * Start any task that was created before the scheduler was running.
+ *
+ * rt_thread_startup() inserts into rt_thread_priority_table[], which
+ * rt_system_scheduler_init() has to initialise first - so a create before that
+ * point can allocate but not start. The create path remembers the thread and
+ * this function starts it once there is a scheduler. Idempotent, and safe to
+ * call from any task context.
+ */
+void ft_task_start_pending(void);
+
 void *ft_task_create(const char *name, void (*entry)(void *),
                      void *param, ft_ubase_t stack_words,
                      ft_ubase_t prio, void **handle);

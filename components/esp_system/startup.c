@@ -192,15 +192,33 @@ static void ESP_SYSTEM_IRAM_ATTR start_cpu_other_cores_default(void)
 
 static void do_core_init(void)
 {
-    do_system_init_fn(ESP_SYSTEM_INIT_STAGE_CORE);
-
-    // Initialize the RT-Thread heap once after IDF's core heap initialization,
-    // before constructors, secondary initialization and scheduler startup.
 #if CONFIG_IDF_RTOS_RTTHREAD && defined(RT_USING_HEAP)
+    /* The RT-Thread heap has to exist before any CORE-stage init function runs,
+     * not after. One of them allocates.
+     *
+     * esp_libc_init -> esp_libc_locks_init creates per-file mutexes, and on the
+     * FreeRTOS shim a mutex is an rt_malloc'ed object, so the very first
+     * rt_malloc of the boot happens inside do_system_init_fn(). With the heap
+     * still uninitialised, rt_smem_alloc() dereferences system_heap == NULL at
+     * src/mem.c:287 and the CPU takes a load access fault at address 0xc
+     * (offsetof(struct rt_object, type)).
+     *
+     * The observed panic, for the record: MEPC 0x400112ce (rt_object_get_type),
+     * A0 = 0, MTVAL = 0xc, called from xQueueCreateMutexStatic via
+     * esp_libc_locks_init. Moving this up is the whole fix - nothing else about
+     * the heap changed.
+     *
+     * Ordering with respect to IDF's own heap: heap_caps_init has already run
+     * as an earlier CORE-stage function, and __heap_start__/__heap_end__ are
+     * linker symbols describing a region IDF deliberately leaves out of its own
+     * allocator, so initialising RT-Thread's heap here cannot take memory from
+     * it. */
     extern int __heap_start__;
     extern int __heap_end__;
     rt_system_heap_init((void *)&__heap_start__, (void *)&__heap_end__);
 #endif // CONFIG_IDF_RTOS_RTTHREAD && defined(RT_USING_HEAP)
+
+    do_system_init_fn(ESP_SYSTEM_INIT_STAGE_CORE);
 }
 
 static void do_secondary_init(void)

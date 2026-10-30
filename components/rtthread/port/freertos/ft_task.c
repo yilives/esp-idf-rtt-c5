@@ -85,6 +85,63 @@ ft_ubase_t ft_prio_to_ft(rt_uint8_t prio)
     return (ft_ubase_t)(RT_THREAD_PRIORITY_MAX - 2u - prio);
 }
 
+/* -------------------------------------------------- pre-scheduler start -- */
+
+/*
+ * Tasks created before the scheduler is running cannot be started yet.
+ *
+ * rt_thread_startup() -> rt_thread_resume() -> rt_sched_insert_thread() walks
+ * rt_thread_priority_table[], and that array is only initialised by
+ * rt_system_scheduler_init(). Creating a task before it - which esp_timer does,
+ * because esp_timer_init() now runs as a SECONDARY-stage init function - stores
+ * into a NULL list head: a store access fault at address 4, inside
+ * rt_list_insert_after (rtservice.h:63).
+ *
+ * rt_thread_create() itself is safe that early: it allocates, initialises the
+ * thread object and its timer, and returns. Only *starting* it touches the
+ * scheduler. So creation is allowed and startup is deferred to the first call
+ * that runs with a scheduler, which is ft_task_self() from any created task or
+ * the explicit flush in the boot path.
+ *
+ * The FIFO order matters for the timer task: esp_timer's alarm ISR looks up
+ * s_timer_task by pointer, and the pointer is valid as soon as create returns,
+ * so starting it late is invisible to the rest of esp_timer.
+ */
+#define FT_PENDING_TASKS    8
+
+static rt_thread_t s_pending[FT_PENDING_TASKS];
+static rt_uint32_t s_pending_count;
+
+/* Called from the first context that has a scheduler. Idempotent. */
+void ft_task_start_pending(void)
+{
+    rt_uint32_t i;
+    rt_base_t   level;
+
+    level = rt_hw_interrupt_disable();
+
+    for (i = 0; i < s_pending_count; i++)
+    {
+        if (s_pending[i] != RT_NULL)
+        {
+            rt_thread_startup(s_pending[i]);
+            s_pending[i] = RT_NULL;
+        }
+    }
+
+    s_pending_count = 0;
+
+    rt_hw_interrupt_enable(level);
+}
+
+static rt_bool_t ft_task_scheduler_ready(void)
+{
+    /* rt_thread_self() is non-NULL only once rt_system_scheduler_start() has
+     * switched to the first thread; that is the same test the scheduler-state
+     * function uses, and the one esp_libc keys its "no locking yet" path off. */
+    return (rt_thread_self() != RT_NULL) ? RT_TRUE : RT_FALSE;
+}
+
 void *ft_task_create(const char *name, void (*entry)(void *), void *param,
                      ft_ubase_t stack_words, ft_ubase_t prio, void **handle)
 {
@@ -113,10 +170,38 @@ void *ft_task_create(const char *name, void (*entry)(void *), void *param,
      * instead of calling vTaskDelete(). See ft_task_exit_hook(). */
     thread->cleanup = ft_task_exit_hook;
 
-    if (rt_thread_startup(thread) != RT_EOK)
+    if (ft_task_scheduler_ready())
     {
-        rt_thread_delete(thread);
-        return RT_NULL;
+        if (rt_thread_startup(thread) != RT_EOK)
+        {
+            rt_thread_delete(thread);
+            return RT_NULL;
+        }
+    }
+    else
+    {
+        /* Defer. The handle is still handed back, so a component that only
+         * stores it - esp_timer keeps s_timer_task for its ISR to notify - sees
+         * what it expects. */
+        rt_base_t level = rt_hw_interrupt_disable();
+
+        if (s_pending_count < FT_PENDING_TASKS)
+        {
+            s_pending[s_pending_count++] = thread;
+        }
+        else
+        {
+            /* Out of slots. Starting now would corrupt the scheduler, so drop
+             * the task instead and say so - a silent failure here would show up
+             * as a component that never runs. */
+            rt_hw_interrupt_enable(level);
+            rt_kprintf("freertos-shim: %d tasks pending before the scheduler, "
+                       "'%s' was dropped\n", FT_PENDING_TASKS, name ? name : "?");
+            rt_thread_delete(thread);
+            return RT_NULL;
+        }
+
+        rt_hw_interrupt_enable(level);
     }
 
     if (handle != RT_NULL)
@@ -475,10 +560,27 @@ ft_tick_t ft_task_tick_count_isr(void)
 
 ft_base_t ft_task_scheduler_state(void)
 {
+    /* Three states, and NOT_STARTED is not decorative.
+     *
+     * esp_libc's lock layer uses it as its "no locking yet" escape hatch
+     * (components/esp_libc/src/locks.c:128 and :137): before the scheduler is up
+     * a lock is a no-op rather than a blocking call. If this function never
+     * reports NOT_STARTED, the very first libc lock taken during CORE init falls
+     * through to the ISR branch instead, because xPortCanYield() is false while
+     * rt_thread_self() is still NULL - and that branch aborts on a recursive
+     * mutex ("recursive mutexes make no sense in ISR context", locks.c:150).
+     *
+     * rt_thread_self() is the honest test: RT-Thread's _rt_scheduler_stack_check
+     * keeps it non-NULL only once a thread is running, and the CORE-stage init
+     * functions do run before that. */
+    if (rt_thread_self() == RT_NULL)
+    {
+        return FT_SCHEDULER_NOT_STARTED;
+    }
+
     /* FreeRTOS reports SUSPENDED while vTaskSuspendAll is in effect, and callers
      * use that to decide whether they may block. rt_critical_level() counts the
-     * same nesting for rt_enter_critical(), so it is the right source. The
-     * NOT_STARTED state is unreachable from a running thread. */
+     * same nesting for rt_enter_critical(), so it is the right source. */
     return rt_critical_level() ? FT_SCHEDULER_SUSPENDED : FT_SCHEDULER_RUNNING;
 }
 

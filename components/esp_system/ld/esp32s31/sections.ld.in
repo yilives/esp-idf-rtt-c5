@@ -44,29 +44,10 @@ SECTIONS
 
 #include "ld.flash.sections"
 
-#if CONFIG_IDF_RTOS_RTTHREAD
-  /* RT-Thread finsh shell symbol table and auto-initialization function table */
-  .flash.rt_thread :
-  {
-    /* finsh shell symbol table */
-    . = ALIGN(8);
-    __fsymtab_start = .;
-    KEEP(*(FSymTab))
-    __fsymtab_end = .;
-    . = ALIGN(8);
-    __vsymtab_start = .;
-    KEEP(*(VSymTab))
-    __vsymtab_end = .;
-    . = ALIGN(8);
-
-    /* RT-Thread auto-initialization function table */
-    . = ALIGN(4);
-    __rt_init_start = .;
-    KEEP(*(SORT(.rti_fn*)))
-    __rt_init_end = .;
-    . = ALIGN(4);
-  } > flash_rodata_seg
-#endif
+/* RT-Thread's finsh symbol table and auto-init callbacks now live inside
+   .flash.rodata - see ld.flash.sections. A standalone section here would
+   be a third loadable segment, which SOC_MMU_DI_VADDR_SHARED chips cannot
+   map (bootloader_utility.c:833 asserts rom_index < 2). */
 
 #include "ld.ext_ram.sections"
 

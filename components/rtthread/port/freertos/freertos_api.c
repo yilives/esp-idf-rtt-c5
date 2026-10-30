@@ -49,6 +49,24 @@ _Static_assert(sizeof(StackType_t) == FT_STACK_UNIT_BYTES,
  * array only has to exist for the linker. */
 void *pxCurrentTCBs[configNUM_CORES] = { NULL };
 
+/*
+ * The static creation path places an ft_ipc inside the caller's StaticQueue_t,
+ * so the two sizes have to stay compatible. struct ft_ipc is opaque here (its
+ * definition belongs to ft_ipc.c), so the check is split in two and joined by a
+ * constant:
+ *
+ *   ft_ipc.c        asserts sizeof(struct ft_ipc) <= FT_IPC_STATIC_BUDGET
+ *   here            asserts sizeof(StaticQueue_t)  >= FT_IPC_STATIC_BUDGET
+ *
+ * Together they mean the placement is sound, and if either side grows the build
+ * stops instead of the static path quietly falling back to the heap.
+ */
+_Static_assert(sizeof(StaticQueue_t) >= sizeof(struct ft_ipc_stub),
+               "StaticQueue_t cannot hold the port's stub, so a static handle "
+               "could not equal the caller's control block");
+_Static_assert(sizeof(StaticSemaphore_t) >= sizeof(struct ft_ipc_stub),
+               "StaticSemaphore_t cannot hold the port's stub");
+
 static BaseType_t ft_result(int rc)
 {
     return (rc >= 0) ? pdTRUE : pdFALSE;
@@ -94,8 +112,12 @@ QueueHandle_t xQueueCreateMutex(const uint8_t ucQueueType)
 QueueHandle_t xQueueCreateMutexStatic(const uint8_t ucQueueType,
                                       StaticQueue_t *pxStaticQueue)
 {
-    return (QueueHandle_t)ft_ipc_create_mutex_static(
-        pxStaticQueue, ucQueueType == queueQUEUE_TYPE_RECURSIVE_MUTEX);
+    /* The handle is the caller's own block, which is what FreeRTOS promises and
+     * esp_libc asserts (locks.c:422). The block holds a stub; the object itself
+     * is on the heap because it would not fit. */
+    return (QueueHandle_t)ft_ipc_create_mutex_stub(
+        pxStaticQueue, sizeof(*pxStaticQueue),
+        ucQueueType == queueQUEUE_TYPE_RECURSIVE_MUTEX);
 }
 
 QueueHandle_t xQueueCreateCountingSemaphore(const UBaseType_t uxMaxCount,
@@ -115,7 +137,7 @@ BaseType_t xQueueGenericSend(QueueHandle_t xQueue,
      * answer there changes ordering rather than failing loudly, so it warns. */
     if (xCopyPosition == queueOVERWRITE)
     {
-        return ft_result(ft_ipc_overwrite((struct ft_ipc *)xQueue, pvItemToQueue));
+        return ft_result(ft_ipc_overwrite(ft_ipc_resolve(xQueue), pvItemToQueue));
     }
 
     if (xCopyPosition == queueSEND_TO_FRONT)
@@ -127,7 +149,7 @@ BaseType_t xQueueGenericSend(QueueHandle_t xQueue,
                      "the item was appended");
     }
 
-    return ft_result(ft_ipc_send((struct ft_ipc *)xQueue, pvItemToQueue, xTicksToWait));
+    return ft_result(ft_ipc_send(ft_ipc_resolve(xQueue), pvItemToQueue, xTicksToWait));
 }
 
 BaseType_t xQueueGenericSendFromISR(QueueHandle_t xQueue,
@@ -137,7 +159,7 @@ BaseType_t xQueueGenericSendFromISR(QueueHandle_t xQueue,
 {
     if (xCopyPosition == queueOVERWRITE)
     {
-        return ft_result(ft_ipc_overwrite_isr((struct ft_ipc *)xQueue, pvItemToQueue,
+        return ft_result(ft_ipc_overwrite_isr(ft_ipc_resolve(xQueue), pvItemToQueue,
                                               (ft_base_t *)pxHigherPriorityTaskWoken));
     }
 
@@ -150,43 +172,43 @@ BaseType_t xQueueGenericSendFromISR(QueueHandle_t xQueue,
                      "implemented, the item was appended");
     }
 
-    return ft_result(ft_ipc_send_isr((struct ft_ipc *)xQueue, pvItemToQueue,
+    return ft_result(ft_ipc_send_isr(ft_ipc_resolve(xQueue), pvItemToQueue,
                                      (ft_base_t *)pxHigherPriorityTaskWoken));
 }
 
 BaseType_t xQueueReceive(QueueHandle_t xQueue, void *const pvBuffer,
                          TickType_t xTicksToWait)
 {
-    return ft_result(ft_ipc_receive((struct ft_ipc *)xQueue, pvBuffer, xTicksToWait));
+    return ft_result(ft_ipc_receive(ft_ipc_resolve(xQueue), pvBuffer, xTicksToWait));
 }
 
 BaseType_t xQueueReceiveFromISR(QueueHandle_t xQueue, void *const pvBuffer,
                                 BaseType_t *const pxHigherPriorityTaskWoken)
 {
-    return ft_result(ft_ipc_receive_isr((struct ft_ipc *)xQueue, pvBuffer,
+    return ft_result(ft_ipc_receive_isr(ft_ipc_resolve(xQueue), pvBuffer,
                                         (ft_base_t *)pxHigherPriorityTaskWoken));
 }
 
 BaseType_t xQueueIsQueueEmptyFromISR(const QueueHandle_t xQueue)
 {
-    return ft_ipc_is_empty((struct ft_ipc *)xQueue);
+    return ft_ipc_is_empty(ft_ipc_resolve(xQueue));
 }
 
 BaseType_t xQueueSemaphoreTake(QueueHandle_t xQueue, TickType_t xTicksToWait)
 {
-    return ft_result(ft_ipc_take((struct ft_ipc *)xQueue, xTicksToWait));
+    return ft_result(ft_ipc_take(ft_ipc_resolve(xQueue), xTicksToWait));
 }
 
 BaseType_t xQueueGiveFromISR(QueueHandle_t xQueue,
                              BaseType_t *const pxHigherPriorityTaskWoken)
 {
-    return ft_result(ft_ipc_give_isr((struct ft_ipc *)xQueue,
+    return ft_result(ft_ipc_give_isr(ft_ipc_resolve(xQueue),
                                      (ft_base_t *)pxHigherPriorityTaskWoken));
 }
 
 UBaseType_t uxQueueMessagesWaiting(const QueueHandle_t xQueue)
 {
-    return (UBaseType_t)ft_ipc_messages_waiting((struct ft_ipc *)xQueue);
+    return (UBaseType_t)ft_ipc_messages_waiting(ft_ipc_resolve(xQueue));
 }
 
 UBaseType_t uxQueueMessagesWaitingFromISR(const QueueHandle_t xQueue)
@@ -195,17 +217,17 @@ UBaseType_t uxQueueMessagesWaitingFromISR(const QueueHandle_t xQueue)
      * callers' world, but it is a plain word here: an ISR that shadows a pending
      * send by one item is not a problem the API contracts against, and taking a
      * lock in an ISR to make a diagnostic exact would be worse. */
-    return (UBaseType_t)ft_ipc_messages_waiting((struct ft_ipc *)xQueue);
+    return (UBaseType_t)ft_ipc_messages_waiting(ft_ipc_resolve(xQueue));
 }
 
 BaseType_t xQueueIsQueueFullFromISR(const QueueHandle_t xQueue)
 {
-    return (BaseType_t)(ft_ipc_spaces_available((struct ft_ipc *)xQueue) == 0);
+    return (BaseType_t)(ft_ipc_spaces_available(ft_ipc_resolve(xQueue)) == 0);
 }
 
 UBaseType_t uxQueueSpacesAvailable(const QueueHandle_t xQueue)
 {
-    return (UBaseType_t)ft_ipc_spaces_available((struct ft_ipc *)xQueue);
+    return (UBaseType_t)ft_ipc_spaces_available(ft_ipc_resolve(xQueue));
 }
 
 /* xQueuePeek: read the front item without removing it.
@@ -218,7 +240,7 @@ UBaseType_t uxQueueSpacesAvailable(const QueueHandle_t xQueue)
 BaseType_t xQueuePeek(QueueHandle_t xQueue, void *const pvBuffer,
                       TickType_t xTicksToWait)
 {
-    struct ft_ipc *ipc = (struct ft_ipc *)xQueue;
+    struct ft_ipc *ipc = ft_ipc_resolve(xQueue);
     int rc;
 
     if (ipc == NULL)
@@ -240,7 +262,7 @@ BaseType_t xQueueGenericReset(QueueHandle_t xQueue, BaseType_t xNewQueue)
 {
     RT_UNUSED(xNewQueue);       /* RT-Thread's ring starts at zero either way */
 
-    return ft_result(ft_ipc_reset((struct ft_ipc *)xQueue));
+    return ft_result(ft_ipc_reset(ft_ipc_resolve(xQueue)));
 }
 
 /* ------------------------------------------------------------ queue set -- */
@@ -258,14 +280,14 @@ BaseType_t xQueueAddToSet(QueueSetMemberHandle_t xQueueOrSemaphore,
                           QueueSetHandle_t xQueueSet)
 {
     return (BaseType_t)ft_qset_add((void *)xQueueSet,
-                                   (struct ft_ipc *)xQueueOrSemaphore);
+                                   ft_ipc_resolve(xQueueOrSemaphore));
 }
 
 BaseType_t xQueueRemoveFromSet(QueueSetMemberHandle_t xQueueOrSemaphore,
                                QueueSetHandle_t xQueueSet)
 {
     return (BaseType_t)ft_qset_remove((void *)xQueueSet,
-                                      (struct ft_ipc *)xQueueOrSemaphore);
+                                      ft_ipc_resolve(xQueueOrSemaphore));
 }
 
 QueueSetMemberHandle_t xQueueSelectFromSet(QueueSetHandle_t xQueueSet,
@@ -282,22 +304,22 @@ QueueSetMemberHandle_t xQueueSelectFromSetFromISR(QueueSetHandle_t xQueueSet)
 
 void vQueueDelete(QueueHandle_t xQueue)
 {
-    ft_ipc_delete((struct ft_ipc *)xQueue);
+    ft_ipc_delete(ft_ipc_resolve(xQueue));
 }
 
 BaseType_t xQueueTakeMutexRecursive(QueueHandle_t xMutex, TickType_t xTicksToWait)
 {
-    return ft_result(ft_ipc_take((struct ft_ipc *)xMutex, xTicksToWait));
+    return ft_result(ft_ipc_take(ft_ipc_resolve(xMutex), xTicksToWait));
 }
 
 BaseType_t xQueueGiveMutexRecursive(QueueHandle_t xMutex)
 {
-    return ft_result(ft_ipc_give((struct ft_ipc *)xMutex));
+    return ft_result(ft_ipc_give(ft_ipc_resolve(xMutex)));
 }
 
 TaskHandle_t xQueueGetMutexHolder(QueueHandle_t xSemaphore)
 {
-    return (TaskHandle_t)ft_ipc_mutex_holder((struct ft_ipc *)xSemaphore);
+    return (TaskHandle_t)ft_ipc_mutex_holder(ft_ipc_resolve(xSemaphore));
 }
 
 /* ------------------------------------------------------------------- task -- */
@@ -646,15 +668,17 @@ QueueHandle_t xQueueGenericCreateStatic(const UBaseType_t uxQueueLength,
     switch (ucQueueType)
     {
     case queueQUEUE_TYPE_MUTEX:
-        return (QueueHandle_t)ft_ipc_create_mutex_static(pxStaticQueue, 0);
+        return (QueueHandle_t)ft_ipc_create_mutex_stub(
+            pxStaticQueue, sizeof(*pxStaticQueue), 0);
 
     case queueQUEUE_TYPE_RECURSIVE_MUTEX:
-        return (QueueHandle_t)ft_ipc_create_mutex_static(pxStaticQueue, 1);
+        return (QueueHandle_t)ft_ipc_create_mutex_stub(
+            pxStaticQueue, sizeof(*pxStaticQueue), 1);
 
     default:
-        return (QueueHandle_t)ft_ipc_create_static_ram(uxQueueLength ? uxQueueLength : 1,
-                                                       uxItemSize, pucQueueStorage,
-                                                       pxStaticQueue);
+        return (QueueHandle_t)ft_ipc_create_stub(
+            uxQueueLength ? uxQueueLength : 1, uxItemSize, pucQueueStorage,
+            pxStaticQueue, sizeof(*pxStaticQueue));
     }
 }
 
@@ -667,8 +691,8 @@ BaseType_t xQueueGenericGetStaticBuffers(QueueHandle_t xQueue,
         return pdFALSE;
     }
 
-    *ppucQueueStorage = (uint8_t *)ft_ipc_storage((struct ft_ipc *)xQueue);
-    *ppxStaticQueue   = (StaticQueue_t *)ft_ipc_static_cb((struct ft_ipc *)xQueue);
+    *ppucQueueStorage = (uint8_t *)ft_ipc_storage(ft_ipc_resolve(xQueue));
+    *ppxStaticQueue   = (StaticQueue_t *)ft_ipc_static_cb(ft_ipc_resolve(xQueue));
 
     return pdTRUE;
 }
@@ -677,8 +701,9 @@ QueueHandle_t xQueueCreateCountingSemaphoreStatic(const UBaseType_t uxMaxCount,
                                                   const UBaseType_t uxInitialCount,
                                                   StaticQueue_t *pxStaticQueue)
 {
-    struct ft_ipc *ipc = ft_ipc_create_static_ram(uxMaxCount ? uxMaxCount : 1, 0,
-                                                  NULL, pxStaticQueue);
+    struct ft_ipc *ipc = ft_ipc_create_stub(uxMaxCount ? uxMaxCount : 1, 0,
+                                            NULL, pxStaticQueue,
+                                            sizeof(*pxStaticQueue));
     UBaseType_t i;
 
     if (ipc == NULL)

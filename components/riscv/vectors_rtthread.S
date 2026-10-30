@@ -246,20 +246,39 @@ spurious_interrupt:
     LOAD  x1,   1 * REGBYTES(sp)
 
     LOAD  t0,   2 * REGBYTES(sp)
-    /* Force MPP=M for frames produced by a cooperative switch.
+    /* Supply MPP=M and, on FPU targets, FS=3.
      *
-     * port/common/context_gcc.S stores mstatus with only MPIE updated for
-     * rt_hw_context_switch(), so MPP is 0 in that frame. If such a frame is
-     * resumed through this trap exit (the tick ISR can pick it), mret would
-     * return to user mode and take a fault. The fix is unconditional on
-     * purpose: every target this file is built for (C3, C6, S31) is
-     * machine-mode only, and a capability predicate would be wrong here -
-     * SOC_INT_HW_NESTED_SUPPORTED is set on ESP32-S31, yet S31 needs the fix
-     * exactly like the PLIC targets do.
+     * Both are missing from a frame produced by a cooperative switch, because
+     * port/common/context_gcc.S stores only MPIE in slot 2 - it masks mstatus
+     * with 8 first (context_gcc.S:152-158). So whatever slot 2 holds, the two
+     * fields a trap exit needs have to be added here.
+     *
+     * MPP is why an mret on such a frame would otherwise return to user mode
+     * and fault. Every target this file is built for (C3, C6, S31) is
+     * machine-mode only, and a capability predicate would be wrong: S31 sets
+     * SOC_INT_HW_NESTED_SUPPORTED yet needs the fix exactly like the PLIC
+     * targets do.
+     *
+     * FS is the one that actually bit us. This file restores f0..f31 with flw
+     * after this point, and executing an FP instruction with mstatus.FS=0 is an
+     * illegal instruction. On ESP32-S31 that is reported as MCAUSE=1
+     * (instruction access fault) with MTVAL equal to the flw's own address,
+     * because SOC_CPU_HAS_FPU_EXT_ILL_BUG means the EXT_ILL CSR does not record
+     * FLW/FSW (soc_caps.h:184) and vectors.S has no rev<3 workaround for this
+     * target. The observed crash was exactly that: MEPC=MTVAL=the first flw of
+     * this epilogue, MSTATUS=0x80006080, i.e. FS read back as 3 at fault time
+     * while the mstatus written one instruction earlier had it at 0.
+     *
+     * context_gcc.S:245 already writes 0x7800 for FPU builds; this is the same
+     * value, so both exits now agree on what a resumed frame looks like.
      */
-    li    t1, 0x1800
+#ifdef RT_FPU_FRAME
+    li    t1, 0x7800                        /* MPP=M | FS=3 */
+#else
+    li    t1, 0x1800                        /* MPP=M */
+#endif
     or    t0, t0, t1
-    csrw  mstatus, t0                       /* Restore the saved interrupt state, supplying MPP=M for cooperative frames. */
+    csrw  mstatus, t0                       /* Restore the saved interrupt state, supplying MPP (and FS on FPU targets). */
 
     LOAD  x3,   3 * REGBYTES(sp)            /* restore gp from slot 3 */
     LOAD  x4,   4 * REGBYTES(sp)

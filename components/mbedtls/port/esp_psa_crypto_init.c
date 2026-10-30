@@ -23,6 +23,8 @@ ESP_SYSTEM_INIT_FN(mbedtls_psa_crypto_init_fn, SECONDARY, BIT(0), 104)
 {
     psa_status_t status = psa_crypto_init();
     if (status != PSA_SUCCESS) {
+        ESP_EARLY_LOGE("psa_init", "psa_crypto_init failed: %d (%s)",
+                       (int)status, "diagnostic");
         return ESP_FAIL;
     }
     return ESP_OK;

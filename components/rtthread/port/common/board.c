@@ -3,6 +3,8 @@
 #include "port_systick.h"
 #include "riscv/interrupt.h"
 #include "esp_heap_caps_init.h"
+#include "esp_err.h"
+#include "esp_private/startup_internal.h"
 
 void rt_hw_board_init(void)
 {
@@ -47,16 +49,7 @@ void rt_hw_board_init(void)
      * Gated on the shim, because esp_timer's task is only needed by the IDF
      * components that run on it (esp_phy, esp_wifi). With the shim off nothing
      * in the image calls esp_timer_create(), so the task would be dead weight. */
-#if CONFIG_IDF_RTOS_RTTHREAD_FREERTOS_SHIM
-    {
-        extern int esp_timer_init(void);
-
-        if (esp_timer_init() != 0)
-        {
-            rt_kprintf("board: esp_timer_init failed\n");
-        }
-    }
-#endif
+    /* esp_timer_init() moved to a SECONDARY-stage init function; see below. */
 
     /* Register the pin device before the scheduler runs so anything that uses
      * rt_pin_*() during init finds it. Also the reference that keeps the GPIO
@@ -121,3 +114,78 @@ static int rt_hw_reclaim_startup_stack(void)
     return 0;
 }
 INIT_APP_EXPORT(rt_hw_reclaim_startup_stack);
+
+#if CONFIG_IDF_RTOS_RTTHREAD
+
+/*
+ * Start esp_timer before any SECONDARY-stage init function needs it.
+ *
+ * esp_timer splits in two. esp_timer_early_init() starts the counter as a
+ * CORE-stage function, so esp_timer_get_time() works early. esp_timer_init()
+ * is the other half - it creates the dispatch task and installs the alarm ISR -
+ * and IDF reaches it from ESP_SYSTEM_INIT_FN(esp_timer_init_os, SECONDARY, ...,
+ * 100), which esp_timer.c:660 compiles out under CONFIG_IDF_RTOS_RTTHREAD with
+ * the comment "RT-Thread takes over the timers".
+ *
+ * That assumption does not hold here. RT-Thread has its own timers, but they are
+ * not esp_timer, and IDF components still call esp_timer_create(): esp_coex does
+ * it at SECONDARY priority 204 through ets_timer_setfn -> esp_timer_create, which
+ * returns ESP_ERR_INVALID_STATE while s_timer_task is NULL (esp_timer.c:105).
+ * ESP_ERROR_CHECK then aborts the boot at ets_timer_legacy.c:58.
+ *
+ * Calling it from rt_hw_board_init() instead - the first version of this fix -
+ * is too late: board init runs from entry(), after do_secondary_init() has
+ * already run every SECONDARY function. It only looked fine because the image
+ * used to panic earlier, in do_core_init, before ever reaching coexist.
+ *
+ * Priority 99 precedes esp_timer_init_os (100, absent here), mbedtls PSA (104)
+ * and coexist (204); lower numbers run first. esp_timer_init() is idempotent,
+ * so a second call from anywhere is harmless.
+ */
+static esp_err_t rt_hw_esp_timer_init(void)
+{
+    extern int esp_timer_init(void);
+
+    if (esp_timer_init() != 0)
+    {
+        rt_kprintf("board: esp_timer_init failed\n");
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+ESP_SYSTEM_INIT_FN(rt_hw_esp_timer_init, SECONDARY, BIT(0), 99)
+{
+    return rt_hw_esp_timer_init();
+}
+
+#endif /* CONFIG_IDF_RTOS_RTTHREAD */
+
+#if CONFIG_IDF_RTOS_RTTHREAD_FREERTOS_SHIM
+
+/*
+ * Start the tasks that were created before the scheduler existed.
+ *
+ * IDF's SECONDARY-stage init functions run before rtthread_startup() reaches
+ * rt_system_scheduler_init(), yet several of them create tasks: esp_timer is the
+ * first, and anything else that pulls in a component with a worker thread
+ * follows. Creating is safe that early, starting is not - see
+ * ft_task_start_pending().
+ *
+ * INIT_COMPONENT_EXPORT, not INIT_APP_EXPORT: this has to run before the
+ * application stage so that nothing in the app stage finds a worker thread that
+ * has not started. rt_components_init() runs from main_thread_entry, i.e. after
+ * rt_system_scheduler_start(), which is exactly the window needed.
+ */
+static int rt_hw_start_pending_tasks(void)
+{
+    extern void ft_task_start_pending(void);
+
+    ft_task_start_pending();
+
+    return 0;
+}
+INIT_COMPONENT_EXPORT(rt_hw_start_pending_tasks);
+
+#endif /* CONFIG_IDF_RTOS_RTTHREAD_FREERTOS_SHIM */
