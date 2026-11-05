@@ -36,6 +36,9 @@
 #include "esp_attr.h"
 #include "ft_core.h"
 
+/* Bumped by libcpu/xtensa/cpuport.c the first time a core publishes a thread. */
+extern volatile rt_uint32_t rt_xt_running_count;
+
 #define FT_MAX_PRIORITIES   25      /* configMAX_PRIORITIES */
 #define FT_TASK_TIMESLICE   10
 #define FT_TLS_SLOTS        (CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS * 2)
@@ -915,7 +918,29 @@ ft_base_t IRAM_ATTR ft_task_scheduler_state(void)
      * rt_thread_self() is the honest test: RT-Thread's _rt_scheduler_stack_check
      * keeps it non-NULL only once a thread is running, and the CORE-stage init
      * functions do run before that. */
-    if (rt_thread_self() == RT_NULL)
+    /*
+     * "Has a thread started running on this core" - asked of the PORT, not of
+     * pcpu->current_thread.
+     *
+     * rt_thread_self() reads _cpus[rt_hw_cpu_id()].current_thread, and on a
+     * dual-core bring-up that word stays NULL for a surprisingly long time: the
+     * second core comes up late, and until the first _rtt_resume() on a core
+     * publishes a thread, the field is zero. Measured with a counter in this
+     * function on the SMP build: 126 calls, rt_cpu_self() == 0x3fcad920 (the
+     * real &_cpus[0]), and current_thread == 0 on every one of them - while
+     * `s3smp`, running later, read `tshell` out of that same address.
+     *
+     * The consequence was not cosmetic. esp_libc's lock layer treats
+     * NOT_STARTED as "locks are no-ops yet" (locks.c:129 and :138), so every
+     * libc lock taken in that window returned success WITHOUT taking anything.
+     * Measured: 21 lock acquisitions, 0 of them actually locked. nvs_flash_init()
+     * then ran its flash sequence with no mutual exclusion at all and hung.
+     *
+     * rt_xt_running_count is bumped by the port on every published switch (see
+     * rt_xt_stat_post_switch), so it answers the question the caller is really
+     * asking and does not depend on a field that can still be NULL.
+     */
+    if (rt_xt_running_count == 0)
     {
         return FT_SCHEDULER_NOT_STARTED;
     }

@@ -210,24 +210,7 @@ int ft_task_notify(void *handle, rt_uint32_t value, ft_base_t action)
 
     if (rc == FT_OK)
     {
-        /* Xtensa-only debug probe: rt_xt_nt is defined in
-         * libcpu/xtensa/cpuport.c, so a RISC-V build has no such symbol and the
-         * link fails. Eighth occurrence of this shape in this port; guarded
-         * rather than deleted because it is someone's active debugging work and
-         * it is correct for the target it was written for. */
-#if defined(__XTENSA__)
-        extern volatile unsigned int rt_xt_nt[8];
-        extern rt_uint8_t rt_sched_thread_get_stat(struct rt_thread *thread);
-
-        rt_xt_nt[0]++;
-        rt_xt_nt[1] = (unsigned)(rt_ubase_t)thread;
-        rt_xt_nt[2] = (unsigned)RT_SCHED_CTX(thread).stat;
         rt_sem_release(&e->sem);
-        rt_xt_nt[3] = (unsigned)RT_SCHED_CTX(thread).stat;
-        rt_xt_nt[4]++;
-#else
-        rt_sem_release(&e->sem);
-#endif
     }
 
     return rc;

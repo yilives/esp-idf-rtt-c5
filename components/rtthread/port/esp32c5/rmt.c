@@ -182,9 +182,14 @@ rt_err_t rt_hw_rmt_set_pin(rt_base_t pin)
      * ever appears on the pad or in the loopback. Measured: txdone=1,
      * int_raw=0x1, and rx still captured zero symbols.
      *
-     * The CAN driver gets this right by accident of being written later
-     * (twai.c passes false) - the same mistake there would have looked like a
-     * broken transceiver. */
+     * The same bug then sat unnoticed in spi.c, where it made the loopback read
+     * all zeros while the master clocked a full transaction, and in i2c.c, where
+     * it happened to be harmless because an open-drain pad is not driven by the
+     * output-enable path at all. Same one-word mistake, three different symptoms.
+     *
+     * This is IDF's own form: gpio_hal_matrix_out() calls
+     * gpio_ll_set_output_enable_ctrl(dev, pin, true, oen_inv) with oen_inv
+     * normally false. */
     gpio_ll_set_output_enable_ctrl(&GPIO, (uint8_t)pin, true, false);
     gpio_ll_input_enable(&GPIO, (uint8_t)pin);
     gpio_ll_pullup_dis(&GPIO, (uint8_t)pin);

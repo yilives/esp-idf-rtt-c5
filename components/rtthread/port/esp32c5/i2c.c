@@ -96,9 +96,18 @@ static rt_err_t c5_i2c_set_pins(rt_uint32_t port, rt_base_t scl, rt_base_t sda)
     gpio_ll_od_enable(&GPIO, scl);
     gpio_ll_od_enable(&GPIO, sda);
 
-    /* Output-enable comes from the peripheral, not from the GPIO register. */
-    gpio_ll_set_output_enable_ctrl(&GPIO, (uint8_t)scl, true, true);
-    gpio_ll_set_output_enable_ctrl(&GPIO, (uint8_t)sda, true, true);
+    /* Output-enable comes from the peripheral, oen_inv = FALSE.
+     *
+     * This used to pass true for the second argument, which is the INVERT flag -
+     * the same mistake that broke the RMT transmitter and later the SPI loopback.
+     * It was harmless here and that is worth stating rather than hiding: the pads
+     * are open-drain (gpio_ll_od_enable above), and an open-drain pad's low state
+     * comes from pulling down regardless of the enable polarity, while its high
+     * state is the pull-up. So the bus worked with the wrong setting, and would
+     * have kept working - right up until someone made the pads push-pull or moved
+     * this code to a peripheral that needs the enable. */
+    gpio_ll_set_output_enable_ctrl(&GPIO, (uint8_t)scl, true, false);
+    gpio_ll_set_output_enable_ctrl(&GPIO, (uint8_t)sda, true, false);
 
     esp_rom_gpio_connect_out_signal((uint32_t)scl, sig->scl_out_sig, false, false);
     esp_rom_gpio_connect_out_signal((uint32_t)sda, sig->sda_out_sig, false, false);

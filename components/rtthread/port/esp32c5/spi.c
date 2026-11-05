@@ -99,7 +99,21 @@ static rt_err_t c5_spi_set_pins(rt_uint32_t port, const struct c5_spi_pins *p)
 
         gpio_ll_func_sel(&GPIO, (uint8_t)pin, PIN_FUNC_GPIO);
         gpio_ll_input_enable(&GPIO, (uint8_t)pin);
-        gpio_ll_set_output_enable_ctrl(&GPIO, (uint8_t)pin, true, true);
+
+        /* ctrl_by_periph = true, oen_inv = FALSE.
+         *
+         * The second argument is the INVERT flag, not "enable", and passing true
+         * there disables the pad exactly when the peripheral wants to drive it.
+         * This is the same mistake that left the RMT transmitter running and
+         * raising tx_end with nothing appearing on the pad (section 17c) - and it
+         * is why the SPI loopback read all zeros while the master clocked a full
+         * transaction.
+         *
+         * This is also IDF's own form: gpio_hal_matrix_out() calls
+         * gpio_ll_set_output_enable_ctrl(dev, pin, true, oen_inv) with
+         * oen_inv normally false, so "the peripheral owns the enable, not
+         * inverted" is the canonical arrangement rather than a local choice. */
+        gpio_ll_set_output_enable_ctrl(&GPIO, (uint8_t)pin, true, false);
     }
 
     esp_rom_gpio_connect_out_signal((uint32_t)p->sclk, sig->spiclk_out, false, false);
@@ -416,24 +430,22 @@ int c5_spi_selftest(rt_uint32_t port, rt_bool_t inside)
         return -1;
     }
 
-    /* Software loopback, attempted and NOT working - kept because the failure is
-     * informative.
+    /* Software loopback: make the MISO pad carry the MOSI signal into its own
+     * input.
      *
-     * The GPIO matrix is pad-centric: a peripheral output goes to a pad, and a
-     * pad's input feeds a peripheral input. So `spid_out` cannot be routed
-     * straight to `spiq_in` - tried first, and rx came back all zeros because
-     * nothing drives the pad.
+     * The GPIO matrix is pad-centric - a peripheral output goes to a pad, and a
+     * pad's input feeds a peripheral input - so `spid_out` cannot be routed
+     * straight to `spiq_in`. It CAN be routed to the MISO pad's output, whose own
+     * input is already wired to `spiq_in` by c5_spi_set_pins(); the pad then
+     * reads back what the master shifts out, with no jumper.
      *
-     * The second attempt makes the MISO pad carry `spid_out` itself, so the pad
-     * drives its own input. Measured: rx is then a constant 0xff rather than the
-     * shifted pattern, i.e. the pad output is enabled but the data does not
-     * reach it - the output-enable for that pad is not tied to the SPI
-     * peripheral's own MOSI enable.
+     * This failed on the first attempt with rx = constant 0xff, and the cause was
+     * the same inverted output-enable as the main pin setup: passing oen_inv =
+     * true here disabled the pad precisely while the data was on it. With the
+     * polarity corrected the pad drives, and the loopback closes inside the chip.
      *
-     * Getting this right needs the pad's OE source wired to the SPI block's
-     * output-enable signal, which is a different matrix slot than the data
-     * signal. Not pursued further: a jumper is a one-second test and this is a
-     * diagnostic convenience. The `jumper` mode below is the real test. */
+     * `inside` is the default mode on `c5spiloop`; `jumper` leaves the matrix
+     * alone for a real wire between IO7 and IO2. */
     if (inside)
     {
         const spi_signal_conn_t *sig = &spi_periph_signal[port + 1];
@@ -441,7 +453,8 @@ int c5_spi_selftest(rt_uint32_t port, rt_bool_t inside)
         esp_rom_gpio_connect_out_signal((uint32_t)C5_SPI0_MISO_PIN,
                                         sig->spid_out, false, false);
         gpio_ll_set_output_enable_ctrl(&GPIO, (uint8_t)C5_SPI0_MISO_PIN,
-                                       true, true);
+                                       true, false);
+        gpio_ll_input_enable(&GPIO, (uint8_t)C5_SPI0_MISO_PIN);
     }
 
     if (rt_spi_transfer(dev, tx, rx, sizeof(tx)) != sizeof(tx))
@@ -452,10 +465,13 @@ int c5_spi_selftest(rt_uint32_t port, rt_bool_t inside)
 
     if (inside)
     {
-        const spi_signal_conn_t *sig = &spi_periph_signal[port + 1];
-
+        /* Hand the pad back: output disconnected from the peripheral, pad input
+         * still feeding spiq_in, which is the arrangement c5_spi_set_pins()
+         * establishes. SIG_GPIO_OUT_IDX is "no peripheral drives this pad"; the
+         * earlier restore-to-spiq_out left the pad's output multiplexer pointing
+         * at a signal nothing generates. */
         esp_rom_gpio_connect_out_signal((uint32_t)C5_SPI0_MISO_PIN,
-                                        sig->spiq_out, false, false);
+                                        SIG_GPIO_OUT_IDX, false, false);
         gpio_ll_output_disable(&GPIO, (uint8_t)C5_SPI0_MISO_PIN);
         gpio_ll_input_enable(&GPIO, (uint8_t)C5_SPI0_MISO_PIN);
     }
