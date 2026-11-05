@@ -46,9 +46,14 @@ struct ft_ipc
 
     /* RT-Thread mutexes are recursive by nature: rt_mutex_take by the owner
      * just bumps hold. FreeRTOS's plain mutex is not, and code relies on that,
-     * so the plain kind is guarded here and only the recursive kind is allowed
-     * to use rt_mutex's own recursion. */
-    rt_thread_t owner;          /* FT_IPC_KIND_MUTEX only */
+     * so the plain kind guards against a second take explicitly - reading
+     * `mutex.owner`, which is the only owner record there is. A shadow copy
+     * used to live in this struct and had to be deleted: rt_thread_delete() on
+     * the holder releases the mutex through _thread_detach_from_mutex()
+     * (src/thread.c) and clears the kernel's owner, with no way to reach a
+     * duplicate here. The stale pointer then survived address reuse and made
+     * the mutex permanently "already held" by whoever landed on that address
+     * next. */
 
     /* Set when the object was heap allocated by ft_ipc_create_static_ram()
      * because the caller's control block (a FreeRTOS StaticQueue_t) is too
@@ -78,7 +83,12 @@ rt_int32_t ft_ticks_to_rt(ft_tick_t ticks)
         return RT_WAITING_FOREVER;
     }
 
-    return (rt_int32_t)(((rt_uint64_t)ticks * RT_TICK_PER_SECOND) / CONFIG_FREERTOS_HZ);
+    /* Round up, so a wait that asks for less than one RT-Thread tick still waits
+     * one instead of turning into a non-blocking poll. Identity today (both
+     * rates are 1 kHz), but the whole point of writing the conversion out is
+     * that changing either rate cannot silently change behaviour. */
+    return (rt_int32_t)((((rt_uint64_t)ticks * RT_TICK_PER_SECOND)
+                         + CONFIG_FREERTOS_HZ - 1u) / CONFIG_FREERTOS_HZ);
 }
 
 rt_size_t ft_ipc_size(void)
@@ -131,13 +141,60 @@ rt_bool_t ft_block_allowed(ft_tick_t ticks, const char *what)
         return RT_FALSE;
     }
 
-    if (rt_critical_level() != 0)
+    /*
+     * No scheduler yet - there is no thread to suspend, and _rt_sem_take()
+     * stores through rt_thread_self() without checking (src/ipc.c:601 then :604
+     * `thread->error = RT_EINTR`). That is a store fault at address 44,
+     * offsetof(struct rt_thread, error), from a NULL base.
+     *
+     * This is a separate window from the mutex check in ft_ipc_take(): that one
+     * short-circuits mutexes, but queues, semaphores and notifications all reach
+     * rt_sem_take() through here, and IDF's SECONDARY stage runs before
+     * rt_system_scheduler_init() and does take semaphores (esp_coex's wrappers
+     * call xSemaphoreTake with OSI_FUNCS_TIME_BLOCKING). Checking the thread here
+     * covers every blocking entry point at once - which is what this function
+     * exists for, and what its own header documents it as doing.
+     *
+     * Returning RT_FALSE makes the callers report FT_ERR_STATE, i.e. a refusal,
+     * never a half-suspended thread.
+     */
+    if (rt_thread_self() == RT_NULL)
+    {
+        if (!warned)
+        {
+            warned = 1;
+            rt_kprintf("freertos-shim: %s cannot block before the scheduler "
+                       "starts\n", what);
+        }
+        return RT_FALSE;
+    }
+
+    /*
+     * A non-zero scheduler nesting is not by itself a reason to refuse.
+     *
+     * rt_enter_critical() / rt_spin_lock() raise the CALLING thread's
+     * critical_lock_nest, and _rt_sem_take() itself takes a spinlock before
+     * suspending - so a thread that legitimately blocks is normally one or two
+     * levels deep. Refusing at the first non-zero level made every blocking
+     * call fail, and esp_ipc's worker (priority 6, above every kernel thread)
+     * then spun in `while (true) { ulTaskNotifyTake(portMAX_DELAY); }`.
+     * Measured consequence: the boot stopped right after the banner because
+     * rt_components_init() never reached finsh_system_init() - the shell thread
+     * was never created at all.
+     *
+     * What must still be refused is a DEEPER nest together with an interrupt
+     * context: those are the two states in which rt_schedule() cannot run and
+     * a suspended thread would be left half-linked. Both are checked above and
+     * below this comment; the plain "nest == 0" rule was the broken one.
+     */
+
+    if (rt_critical_level() > 1)
     {
         if (!warned)
         {
             warned = 1;
             rt_kprintf("freertos-shim: %s cannot block with the scheduler locked "
-                       "(an IDF critical section is held)\n", what);
+                       "(critical level %d)\n", what, (int)rt_critical_level());
         }
         return RT_FALSE;
     }
@@ -474,12 +531,10 @@ void *ft_ipc_mutex_holder(struct ft_ipc *ipc)
         return RT_NULL;
     }
 
-    if (ipc->kind == FT_IPC_KIND_MUTEX)
-    {
-        return ipc->owner;
-    }
-
-    if (ipc->kind == FT_IPC_KIND_RECMUTEX)
+    /* Both mutex kinds answer from the kernel's own owner field. xSemaphoreGet-
+     * MutexHolder is what esp_libc's _lock_close() asserts on, so a stale answer
+     * here turns "this lock is free" into "somebody still holds it". */
+    if (ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX)
     {
         return ipc->mutex.owner;
     }
@@ -781,25 +836,30 @@ int ft_ipc_take(struct ft_ipc *ipc, ft_tick_t ticks)
     {
         rt_thread_t self = rt_thread_self();
 
-        /* FreeRTOS would deadlock here; failing is the only useful answer.
+        /* Non-recursive: a second take by the holder must fail, where FreeRTOS
+         * would deadlock.
          *
-         * `owner != RT_NULL` is load-bearing, not defensive. Before the
-         * scheduler starts rt_thread_self() returns NULL, and so does an
-         * unowned mutex - so a bare `owner == self` comparison says "you
-         * already hold this" for every mutex in the system. That is exactly
-         * what happened on the first boot: mbedtls's PSA initialisation runs at
-         * the SECONDARY stage, takes its global mutex through pthread, got
-         * FT_ERR_TIMEOUT, and psa_crypto_init() reported
-         * PSA_ERROR_SERVICE_FAILURE (-144) - which cpu_start then treated as a
-         * fatal init failure. */
-        if (ipc->owner != RT_NULL && ipc->owner == self)
+         * The check reads `ipc->mutex.owner`, i.e. the kernel's own field -
+         * NOT a copy kept in this struct. A copy goes stale: rt_thread_delete()
+         * on the holder releases the mutex through
+         * _thread_detach_from_mutex() (src/thread.c), which clears
+         * mutex->owner, but it has no way to clear a duplicate here. The
+         * allocator then hands the dead thread's address to a new task, whose
+         * `owner == self` comparison against the stale copy says "you already
+         * hold this" - and that mutex is unusable for the rest of the run,
+         * with esp_libc's _lock_close() also asserting on the phantom holder.
+         *
+         * `owner != RT_NULL` stays load-bearing: before the scheduler starts
+         * rt_thread_self() is NULL and so is an unowned mutex, and NULL == NULL
+         * once made every mutex look self-held (the psa_crypto_init -144 boot
+         * failure). */
+        if (self != RT_NULL && ipc->mutex.owner == self)
         {
             return FT_ERR_TIMEOUT;
         }
 
         if (rt_mutex_trytake(&ipc->mutex) == RT_EOK)
         {
-            ipc->owner = self;
             return FT_OK;
         }
 
@@ -813,13 +873,8 @@ int ft_ipc_take(struct ft_ipc *ipc, ft_tick_t ticks)
             return FT_ERR_STATE;
         }
 
-        if (rt_mutex_take(&ipc->mutex, ft_ticks_to_rt(ticks)) != RT_EOK)
-        {
-            return FT_ERR_TIMEOUT;
-        }
-
-        ipc->owner = self;
-        return FT_OK;
+        return (rt_mutex_take(&ipc->mutex, ft_ticks_to_rt(ticks)) == RT_EOK)
+               ? FT_OK : FT_ERR_TIMEOUT;
     }
 
     return ft_ipc_take_item(ipc, RT_NULL, ticks);
@@ -847,18 +902,22 @@ int ft_ipc_give(struct ft_ipc *ipc)
 
     if (ipc->kind == FT_IPC_KIND_MUTEX)
     {
-        if (ipc->owner != rt_thread_self())
+        /* `mutex.owner`, not a shadow copy - same reason as in ft_ipc_take():
+         * the kernel releases and clears it when the holder dies
+         * (_thread_detach_from_mutex), a copy here would go stale and outlive
+         * the thread it names.
+         *
+         * The comparison is only a fast path for "somebody else is holding", so
+         * that a stray release reports FT_ERR_STATE instead of confusing
+         * rt_mutex_release. Everything else - including the legitimate case of
+         * releasing a mutex whose owner has died, which rt_mutex_release()
+         * explicitly allows via RT_THREAD_CLOSE - is decided by the kernel. */
+        if (ipc->mutex.owner != RT_NULL && ipc->mutex.owner != rt_thread_self())
         {
             return FT_ERR_STATE;    /* only the owner may release */
         }
 
-        if (rt_mutex_release(&ipc->mutex) != RT_EOK)
-        {
-            return FT_ERR_STATE;
-        }
-
-        ipc->owner = RT_NULL;
-        return FT_OK;
+        return (rt_mutex_release(&ipc->mutex) == RT_EOK) ? FT_OK : FT_ERR_STATE;
     }
 
     return ft_ipc_send(ipc, RT_NULL, FT_NO_WAIT);
@@ -1093,22 +1152,24 @@ int ft_ipc_peek(struct ft_ipc *ipc, void *item, ft_tick_t ticks)
 
 /* Empty the queue, keeping its capacity.
  *
- * Every waiting sender and receiver is released first: rt_sem_detach would do
- * that, but these semaphores stay alive. rt_sem_release in a loop is wrong the
- * other way - a receiver woken by the reset has nothing to consume and would
- * re-block, which is only wasted work, while a sender that stays blocked after a
- * reset would hang. So the free-slot count is restored to full, which is what
- * unblocks senders, and the available count is zeroed, which is what a receiver
- * sees as empty.
+ * Both counts are restored through rt_sem_control(RT_IPC_CMD_RESET) rather than
+ * by assigning sem.value, because assignment cannot resume a waiter.
  *
- * Setting sem.value directly is safe here because both counts belong to this
- * object and the reset is defined to be exclusive: FreeRTOS documents the same
- * restriction ("must not be called while the queue is in use").
+ * The previous version wrote `ipc->free_slots.value = ipc->length` from inside a
+ * critical section and claimed that "restores the free-slot count, which is what
+ * unblocks senders". It does not: only rt_sem_release()/rt_sem_control() walk
+ * parent.suspend_thread, so a thread already suspended in rt_sem_take(&free_slots)
+ * - which is exactly what ft_ipc_send(q, item, portMAX_DELAY) does on a full
+ * queue - stayed suspended forever after a reset that was supposed to empty the
+ * queue. FreeRTOS's xQueueGenericReset explicitly unblocks writers (queue.h and
+ * queue.c both say so).
+ *
+ * RT_IPC_CMD_RESET resumes every waiter with -RT_ERROR, which the shim already
+ * maps to pdFALSE. Strictly better than a hang: the caller sees the failure.
  */
 int ft_ipc_reset(struct ft_ipc *ipc)
 {
     ipc = ft_ipc_resolve(ipc);
-    rt_base_t level;
 
     if (ipc == RT_NULL ||
         ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX)
@@ -1116,16 +1177,22 @@ int ft_ipc_reset(struct ft_ipc *ipc)
         return FT_ERR_PARAM;
     }
 
-    level = rt_hw_interrupt_disable();
+    {
+        rt_base_t level = rt_hw_interrupt_disable();
 
-    ipc->head  = 0;
-    ipc->tail  = 0;
-    ipc->count = 0;
+        ipc->head  = 0;
+        ipc->tail  = 0;
+        ipc->count = 0;
 
-    ipc->available.value  = 0;
-    ipc->free_slots.value = ipc->length;
+        rt_hw_interrupt_enable(level);
+    }
 
-    rt_hw_interrupt_enable(level);
+    /* Outside the interrupt lock: rt_sem_control can reschedule. Receivers get
+     * their count zeroed, senders get the full capacity back, and both sets of
+     * waiters are released with an error. */
+    (void)rt_sem_control(&ipc->available, RT_IPC_CMD_RESET, RT_NULL);
+    (void)rt_sem_control(&ipc->free_slots, RT_IPC_CMD_RESET,
+                         (void *)(rt_ubase_t)ipc->length);
 
     return FT_OK;
 }

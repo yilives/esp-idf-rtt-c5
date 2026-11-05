@@ -50,6 +50,10 @@ static volatile bool s_flash_op_complete = false;
 static volatile int s_flash_op_cpu = -1;
 #endif
 
+/* Provided strongly by the RT-Thread port when a second core schedules. */
+void spi_flash_other_core_stop(void);
+void spi_flash_other_core_resume(void);
+
 void spi_flash_init_lock(void)
 {
     s_flash_op_mutex = xSemaphoreCreateRecursiveMutex();
@@ -106,6 +110,19 @@ void IRAM_ATTR spi_flash_op_block_func(void *arg)
     // Re-enable scheduler
     xTaskResumeAll();
 #endif // #if ( ( CONFIG_FREERTOS_SMP ) && ( !CONFIG_FREERTOS_UNICORE ) )
+}
+
+/*
+ * Hooks for a scheduler that runs on a second core while this one disables its flash
+ * cache. Weak, so the common (single-core) case links without them and the RT-Thread port
+ * provides strong definitions.
+ */
+__attribute__((weak)) void IRAM_ATTR spi_flash_other_core_stop(void)
+{
+}
+
+__attribute__((weak)) void IRAM_ATTR spi_flash_other_core_resume(void)
+{
 }
 
 void IRAM_ATTR spi_flash_disable_interrupts_caches_and_other_cpu(void)
@@ -251,6 +268,30 @@ void IRAM_ATTR spi_flash_enable_interrupts_caches_no_os(void)
 
 #else // CONFIG_FREERTOS_UNICORE
 
+/*
+ * Hooks for a scheduler running on a second core.
+ *
+ * The multi-core half of this file is compiled out here, so nothing parks the other core
+ * while our flash cache is off.
+ *
+ * The weak definitions live in THIS branch, not in the multi-core one above: measured on
+ * ESP32-C5 (a single-core target, so CONFIG_FREERTOS_UNICORE is set), the calls in
+ * spi_flash_disable/enable_interrupts_caches_and_other_cpu() had no definition at all and
+ * the link failed with "undefined reference to spi_flash_other_core_stop". The stubs were
+ * sitting inside `#ifndef CONFIG_FREERTOS_UNICORE`, which is the branch that does not call
+ * them. The RT-Thread port still overrides both strongly where it starts a second core.
+ */
+void spi_flash_other_core_stop(void);
+void spi_flash_other_core_resume(void);
+
+__attribute__((weak)) void IRAM_ATTR spi_flash_other_core_stop(void)
+{
+}
+
+__attribute__((weak)) void IRAM_ATTR spi_flash_other_core_resume(void)
+{
+}
+
 void spi_flash_init_lock(void)
 {
 }
@@ -283,6 +324,20 @@ void spi_flash_op_unlock(void)
 void IRAM_ATTR spi_flash_disable_interrupts_caches_and_other_cpu(void)
 {
     spi_flash_op_lock();
+
+    /*
+     * Stop the other core before the cache goes off.
+     *
+     * The multi-core half of this file is compiled out under CONFIG_FREERTOS_UNICORE, so
+     * on a build where RT-Thread *does* schedule a second core nothing parks it - and its
+     * tick handler calls into flash (rt_tick_increase is IROM), which faults with
+     * MCAUSE 0x19 the moment the cache is disabled.
+     *
+     * The hook is weak so this file carries no RT-Thread dependency: the port overrides
+     * it, and a build without SMP links the stub below.
+     */
+    spi_flash_other_core_stop();
+
     esp_intr_noniram_disable();
     spi_flash_disable_cache(0, &s_flash_op_cache_state[0]);
 }
@@ -291,6 +346,10 @@ void IRAM_ATTR spi_flash_enable_interrupts_caches_and_other_cpu(void)
 {
     spi_flash_restore_cache(0, s_flash_op_cache_state[0]);
     esp_intr_noniram_enable();
+
+    /* Let the other core run again, now that its instruction fetches are safe. */
+    spi_flash_other_core_resume();
+
     spi_flash_op_unlock();
 }
 

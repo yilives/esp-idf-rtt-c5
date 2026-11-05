@@ -253,6 +253,43 @@ SECTIONS
   ASSERT(((_bss_end - ORIGIN(dram0_0_seg)) <= LENGTH(dram0_0_seg)),
          "DRAM segment data does not fit.")
 
+#if CONFIG_IDF_RTOS_RTTHREAD
+  /**
+   * RT-Thread kernel heap.
+   *
+   * esp_system/startup.c:do_core_init() calls
+   * rt_system_heap_init(&__heap_start__, &__heap_end__) as the very first thing
+   * it does, before any CORE-stage init function runs, because one of them
+   * allocates (esp_libc_locks_init creates per-file mutexes, which on the
+   * FreeRTOS shim are rt_malloc'ed objects). Without these two symbols the link
+   * fails; without the ordering the first rt_malloc dereferences a NULL
+   * system_heap.
+   *
+   * Placed here, right after .dram0.bss, so the region is inside dram0_0_seg and
+   * below _heap_low_start: IDF's own allocator starts after it, and the two
+   * therefore never overlap. This is a reserved region, not a pool - RT-Thread
+   * hands it to rt_smem, so it must not also be registered with heap_caps.
+   *
+   * CONFIG_IDF_RTTHREAD_HEAP_SIZE defaults to 40 KB.
+   */
+  .heap (NOLOAD) :
+  {
+    . = ALIGN(16);
+    __HEAPSIZE__ = CONFIG_IDF_RTTHREAD_HEAP_SIZE;
+    __heap_start__ = .;
+    . += __HEAPSIZE__;
+    __heap_end__ = .;
+  } > dram0_0_seg
+
+  /* No .stack section here, unlike the S31 port: that one needs
+   * CONFIG_IDF_RTTHREAD_INTERRUPT_STACK_SIZE worth of linker-allocated
+   * interrupt stack because its trap entry is assembly that loads a symbol.
+   * On Xtensa the C-level ISR stack is a static array in
+   * port/esp32s3/cpuport.c, so the linker has nothing to place - and that is
+   * deliberate, because a windowed-ABI caller must reach it through a
+   * 16-byte-aligned address known at assembly time. */
+#endif /* CONFIG_IDF_RTOS_RTTHREAD */
+
   .flash.text :
   {
     _stext = .;
@@ -384,6 +421,42 @@ SECTIONS
     ALIGNED_SYMBOL(4, _esp_sys_init_fn_start)
     KEEP (*(SORT_BY_INIT_PRIORITY(.esp_sys_init_fn.*)))
     _esp_sys_init_fn_end = ABSOLUTE(.);
+
+#if CONFIG_IDF_RTOS_RTTHREAD
+    /**
+     * RT-Thread's three section-based tables.
+     *
+     *   FSymTab      msh commands (MSH_CMD_EXPORT and friends)
+     *   VSymTab      the variable table `msh` can print
+     *   .rti_fn*     INIT_BOARD_EXPORT / INIT_DEVICE_EXPORT / ... entries, plus
+     *                the six boundary markers that components.c defines
+     *
+     * They live inside .flash.rodata rather than in a section of their own,
+     * for the reason recorded in the S31 linker script: a separate loadable
+     * segment would be a third one, and bootloader_utility.c asserts
+     * rom_index < 2 on chips whose D/I vaddrs are shared.
+     *
+     * Without these rules the link fails outright - measured on this port:
+     * "unplaced orphan section `.rti_fn.6.end' from librtthread.a(components.c.obj)"
+     * for each of the six markers, because the S3 script has no equivalent of
+     * the shared ld.flash.sections that emits them for other targets. KEEP() is
+     * what pins them; --gc-sections can still drop individual entries, which is
+     * why CMakeLists.txt also carries one -u per exported init function.
+     */
+    . = ALIGN(8);
+    __fsymtab_start = .;
+    KEEP(*(FSymTab))
+    __fsymtab_end = .;
+    . = ALIGN(8);
+    __vsymtab_start = .;
+    KEEP(*(VSymTab))
+    __vsymtab_end = .;
+    . = ALIGN(4);
+    __rt_init_start = .;
+    KEEP(*(SORT(.rti_fn*)))
+    __rt_init_end = .;
+    . = ALIGN(4);
+#endif /* CONFIG_IDF_RTOS_RTTHREAD */
 
     _rodata_end = ABSOLUTE(.);
 

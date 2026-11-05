@@ -139,7 +139,27 @@ static int LIBC_LOCKS_IRAM_ATTR lock_acquire_generic(_lock_t *lock, uint32_t del
         return 0; /* locking is a no-op before scheduler is up, so this "succeeds" */
     }
     BaseType_t success;
-    if (!xPortCanYield()) {
+    /* xPortInIsrContext(), NOT !xPortCanYield().
+     *
+     * They look interchangeable and are not. xPortCanYield() returns false in
+     * three different situations: genuine interrupt context, an RT-Thread
+     * scheduler lock (rt_critical_level() != 0), and global IRQ masking. Only the
+     * first is "this is an ISR"; the other two are a TASK that happens to hold a
+     * lock - and taking the ISR branch from a task is both wrong and fatal,
+     * because xSemaphoreTakeFromISR() on a held semaphore returns false and the
+     * code below then calls abort().
+     *
+     * Measured on the C5: esp_phy_enable() takes the RT-Thread scheduler lock and
+     * then calls into libc, which lands here, takes the ISR branch, fails, and
+     * aborts. The stack said lock_acquire_generic/locks.c:150 reached from
+     * phy_rf_init -> phy_set_tsens_power -> temperature_sensor_power_acquire ->
+     * adc_apb_periph_claim -> sar_periph_ctrl_adc_reset -> adc_reset_lock_acquire
+     * -> _lock_acquire. It reproduced on `c5ap` and on `c5join5` alike, because
+     * both re-initialise the PHY.
+     *
+     * xPortInIsrContext() answers the question actually being asked: are we in an
+     * interrupt. */
+    if (xPortInIsrContext()) {
         /* In ISR Context */
         if (mutex_type == queueQUEUE_TYPE_RECURSIVE_MUTEX) {
             abort(); /* recursive mutexes make no sense in ISR context */
@@ -195,7 +215,10 @@ static void LIBC_LOCKS_IRAM_ATTR lock_release_generic(_lock_t *lock, uint8_t mut
     SemaphoreHandle_t h = (SemaphoreHandle_t)(*lock);
     assert(h);
 
-    if (!xPortCanYield()) {
+    /* Same distinction as lock_acquire_generic(): a held scheduler lock is not an
+     * interrupt context, and xSemaphoreGiveFromISR() is both unnecessary and
+     * wrong when called from a task. */
+    if (xPortInIsrContext()) {
         if (mutex_type == queueQUEUE_TYPE_RECURSIVE_MUTEX) {
             abort(); /* indicates logic bug, it shouldn't be possible to lock recursively in ISR */
         }
@@ -432,3 +455,4 @@ void esp_libc_locks_init(void)
     esp_libc_newlib_locks_init();
 #endif
 }
+

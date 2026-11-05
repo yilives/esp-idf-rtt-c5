@@ -13,10 +13,15 @@
  *    spinlock rt_event uses internally rather than with a bare interrupt lock,
  *    to stay correct if this ever runs on both cores.
  *
- * 2. FreeRTOS returns the whole bit set as it stands when the wait finishes,
- *    not just the bits that matched. rt_event_recv only reports the matched
- *    bits, so the value is read back from the event object after the call. With
- *    xClearOnExit the read happens after the clear, matching FreeRTOS.
+ * 2. FreeRTOS returns the whole bit set as it stood when the wait was satisfied,
+ *    *before* any bits are cleared. rt_event_recv with RT_EVENT_FLAG_CLEAR
+ *    clears first, so reading the object afterwards returns the post-clear value
+ *    - which for a clear-on-exit wait is 0, and that is wrong. The clear is
+ *    therefore done here instead of by rt_event_recv, which also fixes a second
+ *    difference: FreeRTOS clears only the bits it matched, while
+ *    RT_EVENT_FLAG_CLEAR clears every bit in the wait mask (src/ipc.c:2188
+ *    `event->set &= ~set`). An OR wait for {A,B} that matched only A must leave
+ *    B alone, and that is observable: esp_event's loop waits on several bits.
  */
 
 #include <rtthread.h>
@@ -79,6 +84,7 @@ rt_uint32_t ft_event_set_bits(struct ft_event *event, rt_uint32_t bits)
 rt_uint32_t ft_event_clear_bits(struct ft_event *event, rt_uint32_t bits)
 {
     rt_base_t level;
+    rt_uint32_t before;
 
     if (event == RT_NULL)
     {
@@ -86,10 +92,17 @@ rt_uint32_t ft_event_clear_bits(struct ft_event *event, rt_uint32_t bits)
     }
 
     level = rt_spin_lock_irqsave(&event->event.spinlock);
+
+    /* FreeRTOS returns the value *before* the clear (event_groups.c:503-505).
+     * This used to return the post-clear value; nothing in the tree consumes the
+     * result today, but xEventGroupGetBits() is xEventGroupClearBits(g, 0) and a
+     * caller that starts using the return value would be silently wrong. */
+    before = event->event.set;
     event->event.set &= ~bits;
+
     rt_spin_unlock_irqrestore(&event->event.spinlock, level);
 
-    return event->event.set;
+    return before;
 }
 
 rt_uint32_t ft_event_get_bits(struct ft_event *event)
@@ -108,6 +121,7 @@ rt_uint32_t ft_event_wait_bits(struct ft_event *event, rt_uint32_t bits,
 {
     rt_uint32_t option = wait_for_all ? RT_EVENT_FLAG_AND : RT_EVENT_FLAG_OR;
     rt_uint32_t received = 0;
+    rt_uint32_t before;
 
     if (event == RT_NULL)
     {
@@ -122,10 +136,10 @@ rt_uint32_t ft_event_wait_bits(struct ft_event *event, rt_uint32_t bits,
         return event->event.set;
     }
 
-    if (clear_on_exit)
-    {
-        option |= RT_EVENT_FLAG_CLEAR;
-    }
+    /* RT_EVENT_FLAG_CLEAR is deliberately NOT passed to rt_event_recv: it clears
+     * the entire wait mask, while FreeRTOS clears only the bits that matched.
+     * The clear is done below, under the event's own spinlock, once the caller
+     * has been unblocked. */
 
     /* The same guard every other blocking call in this port has, which this one
      * was missing. rt_event_recv() suspends the caller when the bits are not
@@ -143,5 +157,21 @@ rt_uint32_t ft_event_wait_bits(struct ft_event *event, rt_uint32_t bits,
         return 0;
     }
 
-    return event->event.set;
+    /* Snapshot before clearing: this is what FreeRTOS's return value means. */
+    before = ft_event_get_bits(event);
+
+    if (clear_on_exit)
+    {
+        /* Only the bits the wait matched. For AND that is the whole mask; for
+         * OR it is `mask & set` as it stood when the wait was satisfied, which
+         * `received` already reports. */
+        rt_uint32_t matched = wait_for_all ? bits : received;
+
+        if (matched != 0)
+        {
+            (void)ft_event_clear_bits(event, matched);
+        }
+    }
+
+    return before;
 }

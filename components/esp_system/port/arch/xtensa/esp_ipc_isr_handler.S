@@ -102,9 +102,28 @@ esp_ipc_isr_handler:
     /* Call the esp_ipc_function(void* arg) */
     movi    a0, esp_ipc_func
     l32i    a0, a0, 0
+    /*
+     * Skip the call when no function is armed.
+     *
+     * This handler is level-5 and is raised by writing
+     * SYSTEM_CPU_INTR_FROM_CPU_n_REG. It is not exclusively owned by esp_ipc:
+     * this port's own IPI (board/smp.c) and the scheduler's cross-core wake-up
+     * both write those same registers, so the handler can be entered with
+     * esp_ipc_func still NULL. `callx0 a0` then jumps to address 0.
+     *
+     * Measured on the dual-core bring-up: Core 1 panic'ed
+     * (InstrFetchProhibited), PC : 0x0, A0 : 0x40375c24
+     * (= the instruction after this call), and the resulting panic handler then
+     * faulted again printing the dump.
+     *
+     * Skipping is safe: with nothing armed there is nothing to run, and the end
+     * flag below still marks the handshake complete.
+     */
+    beqz    a0, 3f
     movi    a2, esp_ipc_func_arg
     l32i    a2, a2, 0
     callx0  a0
+3:
 
     /* Done. Restore registers and return. */
     movi    a0, _lx_intr_stack

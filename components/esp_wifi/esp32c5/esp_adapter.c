@@ -190,7 +190,31 @@ static void disable_intr_wrapper(uint32_t intr_mask)
 
 static bool IRAM_ATTR is_from_isr_wrapper(void)
 {
+#if CONFIG_IDF_RTOS_RTTHREAD
+    /* "Am I in an ISR?" - not "may I yield?".
+     *
+     * This is the same conflation that broke Wi-Fi bring-up in esp_libc's
+     * locks.c, and on RT-Thread the two questions have different answers:
+     * xPortCanYield() is also false while the scheduler lock is held, which is
+     * exactly what an IDF critical section leaves behind (vPortEnterCritical ->
+     * rt_enter_critical). On this port that means every call made from inside a
+     * critical section - which the Wi-Fi driver does constantly - was reported
+     * as coming from an ISR.
+     *
+     * The consequence is a lost transmit path, measured: with the predicate
+     * wrong, the driver takes its ISR branch, does a non-blocking queue send, and
+     * a full queue then drops the item instead of blocking. The visible symptom
+     * is a blocking send() from a task that stops after 12-30 KB with every
+     * thread suspended and nothing left to wake the TX path (porting report
+     * §13.3). The stock-FreeRTOS control streams 5.89 MB in the same 10 s.
+     *
+     * xPortInIsrContext() is the honest answer and has the correct RT-Thread
+     * definition (rt_interrupt_get_nest() != 0). This is the only WiFi-relevant
+     * use of the wrong predicate on this target. */
+    return xPortInIsrContext() ? true : false;
+#else
     return !xPortCanYield();
+#endif
 }
 
 static void wifi_thread_semphr_free(void *data)

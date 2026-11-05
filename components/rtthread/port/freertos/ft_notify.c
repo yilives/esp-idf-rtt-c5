@@ -27,7 +27,17 @@
 #include "sdkconfig.h"
 #include "ft_core.h"
 
-#define FT_NOTIFY_TASKS     16
+/* Concurrent threads that can be notified, not total tasks ever created.
+ *
+ * Task notifications are the cheapest blocking primitive esp_timer, esp_eth and
+ * esp_ipc have, and stream buffers do their whole protocol with them - so the
+ * count that matters is "how many tasks can be waiting on a notification at
+ * once". 16 was tight enough that Wi-Fi plus a few drivers could exhaust it, and
+ * the failure mode is a dropped wakeup that looks exactly like a slow peer.
+ *
+ * 64 x (rt_semaphore + two words) is about 3 KiB against a 128 KiB heap, and
+ * the exit hook still frees an entry when the task is reaped. */
+#define FT_NOTIFY_TASKS     64
 
 struct ft_notify
 {
@@ -200,7 +210,15 @@ int ft_task_notify(void *handle, rt_uint32_t value, ft_base_t action)
 
     if (rc == FT_OK)
     {
+        extern volatile unsigned int rt_xt_nt[8];
+        extern rt_uint8_t rt_sched_thread_get_stat(struct rt_thread *thread);
+
+        rt_xt_nt[0]++;
+        rt_xt_nt[1] = (unsigned)(rt_ubase_t)thread;
+        rt_xt_nt[2] = (unsigned)RT_SCHED_CTX(thread).stat;
         rt_sem_release(&e->sem);
+        rt_xt_nt[3] = (unsigned)RT_SCHED_CTX(thread).stat;
+        rt_xt_nt[4]++;
     }
 
     return rc;

@@ -82,7 +82,16 @@ static inline ledc_dev_t *s31_ledc(void)
 }
 
 /* Integer part in bits 8.., fraction in bits 0..7. Same expression as
- * esp_driver_ledc's ledc_calculate_divisor(). */
+ * esp_driver_ledc's ledc_calculate_divisor().
+ *
+ * The previous version CLAMPED an out-of-range divider to the nearest legal
+ * value and returned success, which turns an impossible request into a silently
+ * different frequency: at res 14 the 0x3FFFF ceiling is reached below ~2.38 Hz,
+ * so `rt_pwm_set(ch, 1e9, 5e8)` (1 Hz) produced 2.38 Hz while reporting RT_EOK,
+ * and `PWM_CMD_GET` echoed the requested nanoseconds back. IDF does not clamp
+ * either - LEDC_IS_DIV_INVALID() in esp_driver_ledc/src/ledc.c rejects and
+ * reports LEDC_CLK_NOT_FOUND - so this returns 0 as "cannot represent" and lets
+ * the caller fail loudly. */
 static rt_uint32_t s31_divisor(rt_uint32_t src_hz, rt_uint32_t freq_hz,
                                rt_uint32_t res)
 {
@@ -91,13 +100,12 @@ static rt_uint32_t s31_divisor(rt_uint32_t src_hz, rt_uint32_t freq_hz,
                        ((rt_uint64_t)freq_hz * precision / 2)) /
                       ((rt_uint64_t)freq_hz * precision);
 
-    if (div > S31_LEDC_DIV_MAX)
+    /* Below 1.0 the timer would stall; above the 10.8 ceiling it cannot divide
+     * far enough. Both mean "this period is not achievable at this
+     * resolution". */
+    if (div > S31_LEDC_DIV_MAX || div < 0x100u)
     {
-        div = S31_LEDC_DIV_MAX;
-    }
-    if (div < 0x100u)               /* below 1.0 the timer would stall */
-    {
-        div = 0x100u;
+        return 0;
     }
 
     return (rt_uint32_t)div;
@@ -118,7 +126,15 @@ static rt_uint32_t s31_resolution(rt_uint32_t src_hz, rt_uint32_t freq_hz)
 
 rt_err_t s31_pwm_set_pin(rt_uint32_t channel, rt_base_t pin)
 {
-    if (channel >= S31_PWM_CHANNELS || pin < 0 || pin >= SOC_GPIO_PIN_COUNT)
+    /* The pad has to be checked against the *valid* mask, not the pad count.
+     * GPIO29 and GPIO41 sit inside 0..SOC_GPIO_PIN_COUNT-1 but are wired to the
+     * in-package SPI flash - soc_caps.h:235 clears them from
+     * SOC_GPIO_VALID_GPIO_MASK. Driving one of those from the LEDC takes the pad
+     * away from the flash controller, so the next instruction fetch faults
+     * instead of producing a wrong output level. gpio.c's s31_pin_valid() uses
+     * the same test; this function used to be the one place that did not. */
+    if (channel >= S31_PWM_CHANNELS || pin < 0 || pin >= SOC_GPIO_PIN_COUNT ||
+        ((SOC_GPIO_VALID_GPIO_MASK >> pin) & 1ULL) == 0)
     {
         return -RT_EINVAL;
     }
@@ -164,17 +180,34 @@ static rt_err_t s31_pwm_apply(rt_uint32_t ch, rt_uint32_t period_ns,
     precision = (rt_uint32_t)1u << res;
     duty      = (rt_uint32_t)(((rt_uint64_t)pulse_ns * precision) / period_ns);
 
-    if (duty >= precision)
+    /* 100% is a legal duty: it means "never toggle", which is exactly what a
+     * caller using the channel as a level wants. Clamping to precision - 1
+     * silently makes the rail unreachable - the top of the range came out as
+     * 16383/16384. ledc_ll_set_duty_int_part documents [0, 2**res] as the valid
+     * range. */
+    if (duty > precision)
     {
-        duty = precision - 1;       /* 100% would never toggle the pin */
+        duty = precision;
     }
 
-    /* Every channel bound to this timer shares the period. Documented in
-     * port_pwm.h; the alternative is one timer per channel and there are
-     * only four. */
-    ledc_ll_set_duty_resolution(hw, S31_LEDC_MODE, timer, res);
-    ledc_ll_set_clock_divider(hw, S31_LEDC_MODE, timer,
-                              s31_divisor(S31_LEDC_SRC_HZ, freq_hz, res));
+    /* A divider of 0 means the request cannot be represented; the old code
+     * clamped instead and delivered a different frequency. */
+    {
+        rt_uint32_t div = s31_divisor(S31_LEDC_SRC_HZ, freq_hz, res);
+
+        if (div == 0)
+        {
+            rt_kprintf("s31pwm: %u ns period (about %u Hz) is not reachable "
+                       "at resolution %u\n", period_ns, freq_hz, res);
+            return -RT_EINVAL;
+        }
+
+        /* Every channel bound to this timer shares the period. Documented in
+         * port_pwm.h; the alternative is one timer per channel and there are
+         * only four. */
+        ledc_ll_set_duty_resolution(hw, S31_LEDC_MODE, timer, res);
+        ledc_ll_set_clock_divider(hw, S31_LEDC_MODE, timer, div);
+    }
     ledc_ll_timer_resume(hw, S31_LEDC_MODE, timer);
     ledc_ll_ls_timer_update(hw, S31_LEDC_MODE, timer);
 
@@ -207,6 +240,17 @@ static rt_err_t s31_pwm_control(struct rt_device_pwm *dev, int cmd, void *arg)
     switch (cmd)
     {
     case PWM_CMD_ENABLE:
+        /* Enabling a channel the framework never configured would drive a pin
+         * from a stalled timer (divider 0) and return RT_EOK, which reads as
+         * "enabled but the pin does nothing". IDF reports the same condition as
+         * "LEDC timer not configured" (esp_driver_ledc/src/ledc.c). */
+        if (st->period == 0)
+        {
+            rt_kprintf("s31pwm: channel %u has no period yet; call "
+                       "rt_pwm_set() first\n", ch);
+            return -RT_EINVAL;
+        }
+
         ledc_ll_set_idle_level(hw, S31_LEDC_MODE, ch, 0);
         ledc_ll_set_sig_out_en(hw, S31_LEDC_MODE, ch, true);
         ledc_ll_set_duty_start(hw, S31_LEDC_MODE, ch);
@@ -295,6 +339,7 @@ rt_err_t rt_hw_pwm_init(void)
 
     return rc;
 }
+INIT_BOARD_EXPORT(rt_hw_pwm_init);
 
 /* ------------------------------------------------------------------------- */
 

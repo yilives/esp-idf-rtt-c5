@@ -96,26 +96,50 @@ else()
     list(APPEND srcs "${kernel_impl}/stream_buffer.c")
 endif()
 
-# Add port source files
-list(APPEND srcs
-    "${kernel_impl}/portable/${arch}/port.c")
-
-if(arch STREQUAL "linux")
-    list(APPEND srcs
-        "${kernel_impl}/portable/${arch}/utils/wait_for_event.c")
-    if(kernel_impl STREQUAL "FreeRTOS-Kernel")
-        list(APPEND srcs
-            "${kernel_impl}/portable/${arch}/port_idf.c")
-    endif()
+# Add port source files.
+#
+# On Xtensa under RT-Thread the whole FreeRTOS port is removed, not just the
+# scheduler. Unlike RISC-V - where port.c is kept because vPortSetupTimer() and
+# the critical-section helpers live there - the Xtensa port's portasm.S and
+# port.c define symbols that components/xtensa/xtensa_vectors.S already
+# defines: _xt_user_exit, the coprocessor exception path, the _frxt_* dispatch.
+# Linking both is a duplicate-symbol error, and keeping only part of port.c is
+# not possible either, because it references pxCurrentTCBs and port_IntStack
+# throughout.
+#
+# Everything the RT-Thread port still needs from here is architecture neutral:
+#   port_systick.c   vPortSetupTimer() -> SYSTIMER alarm -> rt_tick_increase()
+#   port_common.c    static-allocation callbacks
+#   list.c           used by esp_additions and by the shim
+# The replacement for the context switch itself lives in
+# components/rtthread/port/esp32s3/{context_gcc.S,cpuport.c,interrupt.c}.
+if(CONFIG_IDF_RTOS_RTTHREAD AND (arch STREQUAL "xtensa"))
+    # Deliberately nothing from portable/xtensa/:
+    #   port.c / portasm.S      duplicate the vector table and the switch
+    #   xtensa_init.c           _xt_tick_divisor_init/_xt_tick_divisor belong
+    #                           to the CCOUNT tick, which this port does not use
+    #   xtensa_overlay_os_hook.c  overlay manager, unused
 else()
     list(APPEND srcs
-        "${kernel_impl}/portable/${arch}/portasm.S")
-endif()
+        "${kernel_impl}/portable/${arch}/port.c")
 
-if(arch STREQUAL "xtensa")
-    list(APPEND srcs
-        "${kernel_impl}/portable/${arch}/xtensa_init.c"
-        "${kernel_impl}/portable/${arch}/xtensa_overlay_os_hook.c")
+    if(arch STREQUAL "linux")
+        list(APPEND srcs
+            "${kernel_impl}/portable/${arch}/utils/wait_for_event.c")
+        if(kernel_impl STREQUAL "FreeRTOS-Kernel")
+            list(APPEND srcs
+                "${kernel_impl}/portable/${arch}/port_idf.c")
+        endif()
+    else()
+        list(APPEND srcs
+            "${kernel_impl}/portable/${arch}/portasm.S")
+    endif()
+
+    if(arch STREQUAL "xtensa")
+        list(APPEND srcs
+            "${kernel_impl}/portable/${arch}/xtensa_init.c"
+            "${kernel_impl}/portable/${arch}/xtensa_overlay_os_hook.c")
+    endif()
 endif()
 
 # Add ESP-additions source files
@@ -178,6 +202,23 @@ endif()
 # Add ESP-additions private include directories
 list(APPEND private_include_dirs
     "esp_additions")                # For `include "freertos_tasks_c_additions.h"`
+
+# Under RT-Thread, headers that reach the kernel include rtthread.h, and
+# rtthread.h -> rttypes.h -> `#include <cpuport.h>` once RT_USING_SMP is on.
+# That header is the CPU port's spinlock type, and it lives in the RT-Thread
+# tree.
+#
+# Without this the build fails the moment SMP is enabled:
+#   rttypes.h:161:10: fatal error: cpuport.h: No such file or directory
+#   <- port_systick.c -> portmacro.h -> FreeRTOS.h -> rtthread.h
+#
+# UP builds never noticed because RT_USING_SMP was off and that include was
+# compiled out, so this is a new need rather than a new break.
+if(CONFIG_IDF_RTOS_RTTHREAD AND (arch STREQUAL "xtensa"))
+    get_filename_component(_rtt_root
+        "${CMAKE_CURRENT_LIST_DIR}/../../../rt-thread" ABSOLUTE)
+    list(APPEND private_include_dirs "${_rtt_root}/libcpu/xtensa")
+endif()
 
 # ------------------------------------------------------- Misc ---------------------------------------------------------
 

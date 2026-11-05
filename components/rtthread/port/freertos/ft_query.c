@@ -217,12 +217,20 @@ ft_base_t ft_task_delay_until(ft_tick_t *prev, ft_tick_t increment)
                            / CONFIG_FREERTOS_HZ);
     now      = rt_tick_get();
 
-    /* FreeRTOS returns pdFALSE when the previous wake time is already in the
-     * past, meaning the caller missed its deadline. Signed comparison on the
-     * difference, so the wrap at 2^32 stays correct. */
-    on_time = ((rt_int32_t)(now - deadline) < 0) ? ftPASS : ftFAIL;
+    /* FreeRTOS tests the *next* wake time against now (tasks.c:1509-1540:
+     * `xTimeToWake = *pxPreviousWakeTime + xTimeIncrement; ... pdFALSE if the
+     * time to wake is in the past`). Testing the previous wake time instead
+     * reports pdFALSE - "I missed my deadline" - for a periodic task that is
+     * merely late by less than one period, which is exactly the case the
+     * function exists to keep exact. */
+    on_time = ((rt_int32_t)(now - (deadline + period)) < 0) ? ftPASS : ftFAIL;
 
-    rt_thread_delay_until(&deadline, period);
+    /* Same guard as every other blocking call - see ft_block_allowed(). A delay
+     * with the scheduler locked parks the caller with no way back. */
+    if (ft_block_allowed(increment, "xTaskDelayUntil"))
+    {
+        rt_thread_delay_until(&deadline, period);
+    }
 
     *prev = (ft_tick_t)(((rt_uint64_t)deadline * CONFIG_FREERTOS_HZ)
                         / RT_TICK_PER_SECOND);

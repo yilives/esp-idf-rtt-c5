@@ -286,21 +286,43 @@ static void start_cpu0_default(void)
 #else
     // Follow src/components.c using public interfaces. IDF has already brought
     // up the other cores, so do not invoke rt_hw_secondary_cpu_up() again.
-    // This path needs board/tick setup and application thread creation from
-    // the port; rt_application_init() is not declared in the public headers.
+    extern void rt_application_init(void);
+    extern void rt_hw_board_init(void);
+
     rt_hw_local_irq_disable();
 #ifdef RT_USING_SMP
     rt_hw_spin_lock_init(&_cpus_lock);
     rt_hw_spin_lock(&_cpus_lock);
 #endif
+
+    /* Board init, which src/components.c does first as well.
+     *
+     * This is NOT optional and it was missing: without it vPortSetupTimer()
+     * never runs (no tick at all), _xt_coproc_init() never runs (no FPU
+     * ownership), and not one INIT_BOARD_EXPORT driver is registered. Measured
+     * on the multi-core build before this line existed: the shell came up and
+     * every command that touched a device returned -1, with `list device`
+     * empty, because nothing had been probed. */
+    rt_hw_board_init();
+
+    rt_show_version();
+
     rt_system_timer_init();
     rt_system_scheduler_init();
 #ifdef RT_USING_SIGNALS
     rt_system_signal_init();
 #endif
+
+    /* And the application thread, which src/components.c creates between the
+     * scheduler init and the timer thread. Without it there is no `main` and no
+     * shell: rt_system_scheduler_start() would switch straight to the idle
+     * thread and sit there. */
+    rt_application_init();
+
     rt_system_timer_thread_init();
     rt_thread_idle_init();
     rt_thread_defunct_init();
+
 #if !CONFIG_ESP_SYSTEM_SINGLE_CORE_MODE
     // Release secondary cores only once scheduler data and idle threads exist.
     // The RT-Thread secondary entry must take _cpus_lock before scheduling.

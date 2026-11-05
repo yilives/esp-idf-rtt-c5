@@ -317,9 +317,12 @@ ft_ubase_t ft_prio_to_ft(rt_uint8_t prio);
  */
 void ft_task_start_pending(void);
 
+/* `core` is the CPU the caller asked for (tskNO_AFFINITY for "any"), carried
+ * through the deferral table so that a task created before the scheduler still
+ * ends up on the core it asked for. */
 void *ft_task_create(const char *name, void (*entry)(void *),
                      void *param, ft_ubase_t stack_words,
-                     ft_ubase_t prio, void **handle);
+                     ft_ubase_t prio, void **handle, int core);
 
 void ft_task_delay(ft_tick_t ticks);
 

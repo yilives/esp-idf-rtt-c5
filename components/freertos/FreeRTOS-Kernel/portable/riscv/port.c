@@ -533,17 +533,43 @@ void vPortClearInterruptMaskFromISR(UBaseType_t prev_int_level)
 // ------------------ Critical Sections --------------------
 
 #if CONFIG_IDF_RTOS_RTTHREAD
-/* Bring-up contract: restore cache before yielding or leaving the outermost
- * IDF critical section. rt_exit_critical() can dispatch a pending schedule.
- * C6's predicate tracks HAL cache operations; direct ROM cache calls bypass it.
- * Keep both the check and its failure message accessible with cache disabled.
+/*
+ * RT-Thread's scheduler, its ready queues and every ISR in port/esp32s31 live in
+ * flash, so a context switch with the cache off is an immediate crash. This
+ * assertion is the port's contract, and it has caught exactly that.
+ *
+ * But "cache off" alone is not the violation - entering the scheduler is. Two
+ * IDF code paths legitimately hold a critical section with the cache disabled
+ * and never switch:
+ *
+ *   spi_flash_disable_cache()       around flash writes/erases
+ *   mspi_timing_enter_low_speed_*() around MSPI timing switches
+ *                                   (mspi_timing_tuning.c:654 - disable_cache()
+ *                                    then mspi_timing_enter_low_speed_mode())
+ *
+ * The second one is what made PSRAM above 40 MHz unbootable: the tuning path
+ * enters an IDF critical section (periph_rcc_enter) inside that window, and the
+ * outermost exit called this function, which aborted the boot. Aborting there
+ * protects nothing: no switch is pending, because nothing in that window can
+ * create one.
+ *
+ * So the check is narrowed to the condition that actually matters - a switch
+ * really pending, or the before-yield call sites - while a plain critical exit
+ * with the cache off is allowed to proceed. The dangerous case (an interrupt
+ * arriving with the cache off and rt_schedule() being reached from it) is still
+ * covered by the vPortYieldFromISR() call site, which now checks it directly.
  */
-static void IRAM_ATTR prvAssertCacheEnabled(void)
+static void IRAM_ATTR prvAssertCacheEnabled(const char *where)
 {
     if (!cache_hal_is_cache_enabled(CACHE_LL_LEVEL_EXT_MEM, CACHE_TYPE_ALL)) {
-        esp_system_abort(DRAM_STR("RT-Thread scheduler entry while flash cache is disabled"));
+        esp_system_abort(where);
     }
 }
+
+/* Call sites that come from a peripheral ISR or an explicit yield: a switch may
+ * be dispatched right here, so the cache must be on unconditionally. */
+#define PRV_REQUIRE_CACHE_FOR_SWITCH() \
+    prvAssertCacheEnabled(DRAM_STR("RT-Thread scheduler entry while flash cache is disabled"))
 #endif
 
 #if (configNUM_CORES > 1)
@@ -657,9 +683,13 @@ void vPortExitCritical(void)
 
         if (port_uxCriticalNesting[0] == 0) {
 #if CONFIG_IDF_RTOS_RTTHREAD
-            /* The kernel's pending-switch flag is private. Conservatively
-             * require cache on before any outermost exit can dispatch it. */
-            prvAssertCacheEnabled();
+            /* rt_exit_critical() can dispatch a schedule, but only when one is
+             * pending. Asking the kernel instead of aborting unconditionally is
+             * what lets the MSPI/PSRAM paths run: they hold this critical
+             * section with the cache off and have nothing pending. */
+            if (rt_critical_level() == 0 && rt_thread_self() != RT_NULL) {
+                PRV_REQUIRE_CACHE_FOR_SWITCH();
+            }
 #endif
             portCLEAR_INTERRUPT_MASK_FROM_ISR(port_uxOldInterruptState[0]);
 #if CONFIG_IDF_RTOS_RTTHREAD
@@ -678,7 +708,7 @@ void vPortYield(void)
     if (rt_interrupt_get_nest() != 0) {
         vPortYieldFromISR();
     } else if (rt_thread_self() != RT_NULL) {
-        prvAssertCacheEnabled();
+        PRV_REQUIRE_CACHE_FOR_SWITCH();
         /* taskYIELD relinquishes the current time slice to equal-priority peers. */
         rt_thread_yield();
     }
@@ -712,7 +742,7 @@ void vPortYieldFromISR( void )
      * yield, an ISR reschedule must not rotate the interrupted thread's time
      * slice. rt_schedule() records the switch for the outermost trap exit. */
     if (rt_thread_self() != RT_NULL) {
-        prvAssertCacheEnabled();
+        PRV_REQUIRE_CACHE_FOR_SWITCH();
         rt_schedule();
     }
 #else

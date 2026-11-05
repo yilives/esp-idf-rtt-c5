@@ -59,6 +59,59 @@ void rt_hw_interrupt_set_priority(int vector, rt_uint32_t priority);
  */
 void rt_hw_interrupt_uninstall(int vector, rt_isr_handler_t handler, void *param);
 
+/**
+ * Whether a CPU line's CLIC enable bit is currently clear.
+ *
+ * Needed because the obvious way to ask - esprv_int_get_priority() == 0 - reads
+ * the *level*, not the enable bit, and the two are different: a line can be
+ * enabled at level 0 (which the threshold then masks) or enabled at level 1 and
+ * separately disabled through CLIC INTIE. Only INTIE is what this port writes.
+ */
+rt_bool_t rt_hw_interrupt_is_masked(int vector);
+
+/**
+ * How many times the trampoline has entered a line's handler.
+ *
+ * Diagnostic only: a counter that keeps climbing while no thread runs is the
+ * signature of an interrupt storm, and the watchdog dump alone cannot name the
+ * line. Returns 0 for an out-of-range vector.
+ */
+rt_uint32_t rt_hw_interrupt_entry_count(int vector);
+
+/**
+ * The one function with the signature esp_intr_alloc()/intr_handler_t expects.
+ *
+ * Drivers that allocate a line through the IDF allocator (esp_intr_alloc) must
+ * pass this, with a struct rtt_isr_ctx *-shaped argument obtained from
+ * rt_hw_interrupt_install + intr_handler_get_arg. In practice they call
+ * rt_hw_interrupt_install(n, fn, arg, name) first and then
+ * esp_intr_alloc(source, flags, rtt_trampoline, <that same line's ctx>, &h).
+ *
+ * Exported because port/esp32s31/gpio.c needs exactly that: the line number has
+ * to come from the allocator (a hardcoded one collides with the OS tick - see
+ * the note in gpio.c), while the handler still has to look like an RT-Thread
+ * ISR to the rest of the port.
+ */
+/* No IRAM_ATTR here: it expands to a __COUNTER__-suffixed section name, so
+ * repeating it on the declaration gives a conflicting section attribute. The
+ * definition in interrupt.c carries it. */
+void rtt_trampoline(void *arg);
+
+/**
+ * Mask every CPU line that is enabled but has no handler.
+ *
+ * An enabled line with an empty handler slot is not harmless: CLIC lines are
+ * level-triggered by reset and _global_interrupt_handler() silently returns when
+ * the slot is empty, so the trap re-enters forever and the only witness is the
+ * interrupt watchdog. This was the root cause of the PSRAM bring-up crash.
+ *
+ * Call once, after every init stage that can allocate an interrupt (i.e. at the
+ * end of board init, not before the SECONDARY-stage IDF inits have run).
+ *
+ * @return number of lines masked
+ */
+int rt_hw_intr_mask_unhandled(void);
+
 #ifdef __cplusplus
 }
 #endif

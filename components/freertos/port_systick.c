@@ -1,4 +1,4 @@
-/*
+﻿/*
  * SPDX-FileCopyrightText: 2017-2024 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
@@ -218,9 +218,68 @@ BaseType_t xPortSysTickHandler(void)
      * Protect the kernel tick from nesting; requested thread switches run at
      * the outermost trap exit.
      */
-    rt_base_t level = rt_hw_interrupt_disable();
+    /*
+     * LOCAL mask, not rt_hw_interrupt_disable().
+     *
+     * Under RT_USING_SMP rthw.h:146 defines rt_hw_interrupt_disable as
+     * rt_cpus_lock - which takes the GLOBAL _cpus_lock spinlock and bumps
+     * current_thread->cpus_lock_nest. Doing that from an interrupt handler is
+     * wrong twice over: the handler runs on the ISR stack with the preempted
+     * thread's window state spilled elsewhere, and the spinlock's S32C1I plus the
+     * extra windowed-ABI calls are exactly what the crash log shows
+     * (rt_cpus_lock -> rt_soft_atomic_load -> rt_hw_interrupt_disable with
+     * sp = 0x3fc80020, below DRAM).
+     *
+     * rt_hw_local_irq_disable only raises PS.INTLEVEL on this core - which is all
+     * a handler needs, since it is already running with interrupts masked at its
+     * own level.
+     */
+
+
+    /*
+     * Acknowledge and park while the other core has its instruction cache off.
+     *
+     * Everything below this point up to the acknowledgement is IRAM-resident, so
+     * it is safe to run with the cache disabled. The park loop is what CPU0's
+     * spi_flash_other_core_stop() waits for; without it that wait times out and
+     * CPU0 proceeds to touch flash while this core is still fetching from it.
+     *
+     * Guarded on the flag first so the common tick costs one load.
+     */
+#if defined(__XTENSA__) && (configNUM_CORES > 1)
+    /* Dual-core Xtensa only: a cache-off handshake between CPU0 and CPU1, plus a
+     * debugging probe for it. `xt_rt_flash_op`, `xt_rt_flash_ack` and `rt_xt_pk`
+     * are all defined in the Xtensa port; a single-core RISC-V build (the C5) has
+     * none of them and the link fails with undefined references to all three.
+     *
+     * Guarded, not deleted - this is active work on the SMP Xtensa target, and it
+     * is correct there.
+     *
+     * This is the THIRD distinct block of Xtensa-only instrumentation to appear in
+     * this one file during this port (after rt_xt_br and rt_xt_sst). Anything added
+     * to xPortSysTickHandler needs to answer "does this exist on RISC-V?" before it
+     * compiles here. */
+    {
+        extern volatile rt_uint32_t xt_rt_flash_op;
+        extern volatile rt_uint32_t xt_rt_flash_ack;
+
+        if (xt_rt_flash_op != 0)
+        {
+            xt_rt_flash_ack = 1;
+
+            while (xt_rt_flash_op != 0)
+            {
+                /* CPU0 clears the flag once its cache is back on. */
+            }
+        }
+    }
+#endif /* __XTENSA__ && configNUM_CORES > 1 */
+
+
+
+    rt_base_t level = rt_hw_local_irq_disable();
     rt_tick_increase();
-    rt_hw_interrupt_enable(level);
+    rt_hw_local_irq_enable(level);
     traceISR_EXIT();
     return pdFALSE;
 #else

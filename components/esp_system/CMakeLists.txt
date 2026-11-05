@@ -89,9 +89,11 @@ else()
 
     set(rtthread_requires "")
     # Kconfig values are not populated during early dependency discovery, so match
-    # on the target too, to keep MINIMAL_BUILD working on C3/C6 clean builds.
+    # on the target too, to keep MINIMAL_BUILD working on a clean build.
     if(CONFIG_IDF_RTOS_RTTHREAD OR
-       (CMAKE_BUILD_EARLY_EXPANSION AND (target STREQUAL "esp32c3" OR target STREQUAL "esp32c6")))
+       (CMAKE_BUILD_EARLY_EXPANSION AND (target STREQUAL "esp32c3" OR target STREQUAL "esp32c5"
+                                         OR target STREQUAL "esp32c6"
+                                         OR target STREQUAL "esp32s3" OR target STREQUAL "esp32s31")))
         list(APPEND rtthread_requires rtthread)
     endif()
 

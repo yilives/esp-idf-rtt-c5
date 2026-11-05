@@ -61,19 +61,58 @@ static void wifi_free(void *h, void* buffer)
     }
 }
 
+/* TX outcome counters, added to diagnose the RT-Thread transmit stall.
+ *
+ * lwIP's pcb dump on this port shows a stuck connection with TF_NAGLEMEMERR
+ * (0x80) set, snd_buf=0, four MSS-sized segments queued and nothing in flight.
+ * TF_NAGLEMEMERR persists only when tcp_output() did not reach its clearing
+ * path, which happens when tcp_output_segment() fails - i.e. when this function
+ * returned an error. So the question "does the Wi-Fi driver reject these frames?"
+ * can be answered here, and these two counters answer it without a debugger.
+ *
+ * Deliberately plain increments: this runs in the tcpip thread, and the counters
+ * are only read by a console command. */
+volatile uint32_t g_c5_wifi_tx_ok;
+volatile uint32_t g_c5_wifi_tx_err_nomem;
+volatile uint32_t g_c5_wifi_tx_err_other;
+
+static void wifi_transmit_counted(void *h, void *buffer, size_t len, esp_err_t err)
+{
+    (void)h;
+    (void)buffer;
+    (void)len;
+
+    if (err == ESP_OK) {
+        g_c5_wifi_tx_ok++;
+    } else if (err == ESP_ERR_NO_MEM) {
+        g_c5_wifi_tx_err_nomem++;
+    } else {
+        g_c5_wifi_tx_err_other++;
+    }
+}
+
 static esp_err_t wifi_transmit(void *h, void *buffer, size_t len)
 {
     wifi_netif_driver_t driver = h;
-    return esp_wifi_internal_tx(driver->wifi_if, buffer, len);
+    esp_err_t err = esp_wifi_internal_tx(driver->wifi_if, buffer, len);
+
+    wifi_transmit_counted(h, buffer, len, err);
+    return err;
 }
 
 static esp_err_t wifi_transmit_wrap(void *h, void *buffer, size_t len, void *netstack_buf)
 {
     wifi_netif_driver_t driver = h;
 #if CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP && !CONFIG_SPIRAM_IGNORE_NOTFOUND
-    return esp_wifi_internal_tx_by_ref(driver->wifi_if, buffer, len, netstack_buf);
+    esp_err_t err = esp_wifi_internal_tx_by_ref(driver->wifi_if, buffer, len, netstack_buf);
+
+    wifi_transmit_counted(h, buffer, len, err);
+    return err;
 #else
-    return esp_wifi_internal_tx(driver->wifi_if, buffer, len);
+    esp_err_t err = esp_wifi_internal_tx(driver->wifi_if, buffer, len);
+
+    wifi_transmit_counted(h, buffer, len, err);
+    return err;
 #endif
 }
 

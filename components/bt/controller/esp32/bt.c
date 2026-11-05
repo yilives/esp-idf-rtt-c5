@@ -868,7 +868,30 @@ static void task_delete_wrapper(void *task_handle)
 
 static bool IRAM_ATTR is_in_isr_wrapper(void)
 {
+#if CONFIG_IDF_RTOS_RTTHREAD
+    /* "Am I in an ISR?" - not "may I yield?".
+     *
+     * Same conflation as esp_libc's locks.c and esp_wifi's C5 esp_adapter.c,
+     * both fixed earlier in this port. On RT-Thread xPortCanYield() is also
+     * false while the scheduler lock is held, which is what an IDF critical
+     * section leaves behind (vPortEnterCritical -> rt_enter_critical), so every
+     * call made from inside a critical section was reported as an ISR.
+     *
+     * This one is the Bluetooth controller's, and it is the only esp32 target
+     * file that still had the old form: the BT controller for C5 is a prebuilt
+     * library (controller/lib_esp32c5) driven through this OS adapter, so the
+     * predicate decides which of the two code paths the controller takes - the
+     * blocking one or the ISR one - for every queue send, semaphore give and
+     * task-notification it makes.
+     *
+     * BLE works today with the wrong predicate, which is why this was left
+     * alone for several rounds. That makes it latent, not absent: the failure
+     * mode it produces on the Wi-Fi side was a transmit path that silently
+     * stopped. Fixed here for the same reason the other two were. */
+    return xPortInIsrContext() ? true : false;
+#else
     return !xPortCanYield();
+#endif
 }
 
 static void IRAM_ATTR cause_sw_intr(void *arg)

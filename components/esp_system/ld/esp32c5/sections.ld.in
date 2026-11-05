@@ -15,7 +15,43 @@ SECTIONS
 
 #include "ld.dram.sections"
 
+#if CONFIG_IDF_RTOS_RTTHREAD
+  /* Use 16-byte alignment for the RISC-V stack ABI and RT-Thread RT_ALIGN_SIZE. */
+  /* RT-Thread interrupt stack: vectors_rtthread.S switches to it via
+   * __stack_end__ (through the rt_irq_stack_top table, see
+   * components/rtthread/port/esp32c5/cpuport.c). */
+  .stack :
+  {
+      . = ALIGN(16);
+      __STACKSIZE__ = CONFIG_IDF_RTTHREAD_INTERRUPT_STACK_SIZE;
+      __stack_start__ = .;
+      *(.stack*)
+      . = ALIGN(16);
+      . += __STACKSIZE__;
+      __stack_cpu0 = .;
+      __stack_end__ = .;
+  } > dram_seg
+  PROVIDE( __rt_rvstack = __stack_end__);
+
+  /* RT-Thread heap: the region handed to rt_system_heap_init() from
+   * startup.c:do_core_init(). Disjoint from the IDF heap on purpose. */
+  .heap :
+  {
+      . = ALIGN(16);
+      __HEAPSIZE__ = CONFIG_IDF_RTTHREAD_HEAP_SIZE;
+      __heap_start__ = .;
+      . += __HEAPSIZE__;
+      __heap_end__ = .;
+  } > dram_seg
+#endif
+
 #include "ld.flash.sections"
+
+/* RT-Thread's finsh symbol table and auto-init callbacks live inside
+   .flash.rodata - see ld.flash.sections. A standalone section after the NOLOAD
+   ones would be a third loadable segment, which SOC_MMU_DI_VADDR_SHARED chips
+   cannot map (bootloader_utility.c:833 asserts rom_index < 2). The C5 is one of
+   those chips. */
 
 #include "ld.ext_ram.sections"
 

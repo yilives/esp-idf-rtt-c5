@@ -18,6 +18,7 @@
  */
 
 #include <rthw.h>
+#include "esp_rom_sys.h"
 #include <rtthread.h>
 #include <rtdevice.h>
 
@@ -27,7 +28,10 @@
 #include "soc/uart_reg.h"
 #include "soc/interrupts.h"
 #include "hal/uart_ll.h"
+#include "esp_attr.h"
+#include "esp_rom_serial_output.h"
 
+#include "riscv/interrupt.h"
 #include "port_intr.h"
 #include "port_serial.h"
 
@@ -139,16 +143,50 @@ static const struct rt_uart_ops s31_uart_ops =
 
 /* Runs through vectors_rtthread.S: the CLIC slot for ETS_UART0_INUM (5) is
  * mtvt slot 21, which points at _interrupt_handler. */
-static void s31_uart_isr(int vector, void *param)
+static void IRAM_ATTR s31_uart_isr(int vector, void *param)
 {
-    uint32_t status = uart_ll_get_intraw_mask(&UART0);
+    /* The MASKED view, not int_raw.
+     *
+     * Reading int_raw acknowledges every latched bit, including the error flags -
+     * RXFIFO overflow, parity, frame error. They were then cleared by the write
+     * below and never reported, so an overrun (a pasted command line, or the
+     * shell preempted for a few milliseconds while 64 bytes of input arrive)
+     * silently vanished: no error event, no indication, and dev_serial's ring
+     * overflow path then discards the whole unread span.
+     *
+     * int_st is raw AND the enable mask, so only the interrupts this driver
+     * asked for are cleared and handled. */
+    rt_uint32_t status = uart_ll_get_intsts_mask(&UART0);
+    static rt_uint32_t overruns;
 
     RT_UNUSED(vector);
     RT_UNUSED(param);
 
-    /* Clear first: the ring-buffer fill below may take longer than the next
-     * character's arrival. */
     uart_ll_clr_intsts_mask(&UART0, status);
+
+    /* dev_serial.c's v1 RX path ignores the error bits in `event` (it switches on
+     * `event & 0xff` and only acts on RX_IND), so passing them up would be lost
+     * anyway. Report the loss directly and rate-limit it: a bring-up image wants
+     * "input was dropped" printed once, not a silent truncation.
+     *
+     * esp_rom_printf, not rt_kprintf, and the reason is measured placement:
+     *
+     *     s31_uart_isr     0x2f002c66  t   IRAM
+     *     rt_kprintf       0x400128ba  W   flash
+     *     esp_rom_printf   0x2f800024  A   ROM
+     *
+     * This function lives in IRAM so it can run while the flash cache is off - the
+     * window IDF opens for SPI-flash writes and for MSPI/PSRAM timing tuning. A
+     * flash-resident callee faults in that window. The port already applies this
+     * rule to _interrupt_handler; it had not been applied to the driver ISRs. */
+    if (status & UART_RXFIFO_OVF_INT_RAW)
+    {
+        if (overruns++ == 0)
+        {
+            esp_rom_printf("uart0: RX FIFO overrun (input dropped; the 64-byte "
+                           "ring cannot keep up)\n");
+        }
+    }
 
     if (status & UART0_RX_INTR_MASK)
     {
@@ -156,7 +194,7 @@ static void s31_uart_isr(int vector, void *param)
     }
 }
 
-int rt_hw_uart0_init(void)
+rt_err_t rt_hw_uart0_init(void)
 {
     struct serial_configure config = RT_SERIAL_CONFIG_DEFAULT;
 
@@ -184,7 +222,58 @@ int rt_hw_uart0_init(void)
     {
         return -RT_ERROR;
     }
+    /* Confirm the slot took the handler rather than trusting the return value.
+     *
+     * rt_hw_interrupt_install() returns RT_NULL both for "installed, there was no
+     * previous handler" - the normal case here - and for "vector rejected". Testing
+     * the result therefore proves nothing; asking the slot does. A driver that failed
+     * this way would initialise cleanly, register cleanly, and never receive a byte.
+     */
     rt_hw_interrupt_install(ETS_UART0_INUM, s31_uart_isr, RT_NULL, "uart0");
 
-    return 0;
+    if (intr_handler_get(ETS_UART0_INUM) == RT_NULL)
+    {
+        rt_kprintf("uart0: INUM %d did not take the handler\n", ETS_UART0_INUM);
+        return -RT_ERROR;
+    }
+
+    return RT_EOK;
 }
+/*
+ * Console output, in the driver layer where RT-Thread expects it.
+ *
+ * Upstream BSPs define rt_hw_console_output() in board.c or drv_console.c, not in
+ * applications/: 44 of the 45 definitions in this tree are outside
+ * applications/, and the application is supposed to be portable across boards.
+ * This port had it in main.c, which meant every new application would have had to
+ * write it again - and the "console works" property looked like an application
+ * feature rather than a board one.
+ *
+ * Uses the ROM's UART0 writer on purpose: it needs no driver state, so a fault in
+ * the serial driver cannot take the console down with it, and rt_kprintf stays
+ * usable from the panic path. The port deliberately never calls
+ * rt_console_set_device(), so this function is what rt_kprintf actually uses -
+ * see _kputs() in kservice.c, which falls back here when no console device is
+ * set.
+ */
+void rt_hw_console_output(const char *str)
+{
+    while (*str)
+    {
+        if (*str == '\n')
+        {
+            esp_rom_output_putc('\r');
+        }
+        esp_rom_output_putc(*str++);
+    }
+}
+
+/*
+ * Register uart0 the RT-Thread way.
+ *
+ * The `-u rt_hw_uart0_init` in CMakeLists.txt was added when this was a plain
+ * hand-called function, to stop the archive member being dropped. Now that the
+ * board band owns the call, the same flag keeps the member alive - and the export
+ * states the intent, which the bare `-u` did not.
+ */
+INIT_BOARD_EXPORT(rt_hw_uart0_init);

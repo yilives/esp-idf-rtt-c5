@@ -6,6 +6,15 @@
 
 #include "sdkconfig.h"
 
+/* rtconfig.h decides RT_USING_SMP, and the trap path has to know: in an SMP
+ * build the three switch globals do not exist and the kernel performs the IRQ
+ * switch itself. The RT-Thread component publishes its config directory
+ * globally (CMakeLists: idf_build_set_property(INCLUDE_DIRECTORIES ...)), so
+ * this include resolves without touching the riscv component's own paths. */
+#if CONFIG_IDF_RTOS_RTTHREAD
+#include "rtconfig.h"
+#endif
+
 #if CONFIG_IDF_RTOS_RTTHREAD
 
 #include "soc/soc.h"
@@ -141,11 +150,44 @@ _tee_interrupt_handler:
     /* Only the outermost interrupt switches to the system interrupt stack. Nested
      * interrupts already use that stack; reloading __stack_end__ would overwrite
      * the outer frame, so continue growing downward from the current sp. */
-    la    t0, rt_interrupt_nest
-    lw    t0, 0(t0)
+    /* This core's interrupt nest counter.
+     *
+     * The single-core build reads the global directly: one `la` and one load,
+     * nothing that can land in flash, and this exact shape has been running
+     * since the first bring-up.
+     *
+     * The SMP build cannot use a global there - rt_interrupt_nest is a macro
+     * over rt_cpu_self()->irq_nest (irq.c:68) and has no symbol - so it indexes
+     * an IRAM table of per-CPU pointers with mhartid. It cannot use a call
+     * either: IDF disables the flash cache while tuning MSPI/PSRAM timing, and a
+     * flash-resident callee faults in that window (observed: MEPC 0x40013b1e
+     * resolved to rt_enter_critical in IROM).
+     *
+     * The two builds therefore read this value differently on purpose. */
+    la    t2, rt_irq_nest_slot
+    csrr  t0, mhartid
+    slli  t0, t0, 2
+    add   t0, t0, t2
+    lw    t0, 0(t0)         /* t0 = slot[n], the address of this core's counter */
+    lw    t0, 0(t0)         /* t0 = the counter itself - the branch needs a value,
+                             * not a pointer: a pointer is never zero, so a missing
+                             * load here makes every interrupt look nested */
     bnez  t0, _rtthread_nested_entry
-    /* Switch to the system interrupt stack for C interrupt service calls. */
-    la    sp, __stack_end__
+    /* Switch to this core's interrupt stack for C interrupt service calls.
+     *
+     * A single literal address was correct while there was one core. With two,
+     * both cores would push frames downward from the same place and overwrite
+     * each other, so the top comes from a per-CPU table instead - indexed the
+     * same way as the nest counter above, and for the same reason (no call: the
+     * cache can be off here).
+     *
+     * rt_irq_stack_top[0] is still __stack_end__, so CPU0 is unaffected.
+     */
+    la    t2, rt_irq_stack_top
+    csrr  t0, mhartid
+    slli  t0, t0, 2
+    add   t0, t0, t2
+    lw    sp, 0(t0)
 _rtthread_nested_entry:
     /* Reserve 16 bytes per level for C stack alignment. Nested slots grow downward
      * without overwriting outer slots; the outer thread stack pointer does not
@@ -189,6 +231,7 @@ _rtthread_nested_entry:
     and   a1, a1, t0      /* Mask off the interrupt flag in mcause. */
     jal   _global_interrupt_handler
 
+
     li    t0, 0x8
     csrrc t0, mstatus, t0 /* Disable global interrupts before a possible context switch. */
 
@@ -213,10 +256,46 @@ _rtthread_nested_entry:
 #endif // SOC_INT_HW_NESTED_SUPPORTED
 
     /* Nested exits restore the interrupted handler; only the outermost exit schedules. */
-    la    t0, rt_interrupt_nest
-    lw    t0, 0(t0)
+    /* This core's interrupt nest counter.
+     *
+     * The single-core build reads the global directly: one `la` and one load,
+     * nothing that can land in flash, and this exact shape has been running
+     * since the first bring-up.
+     *
+     * The SMP build cannot use a global there - rt_interrupt_nest is a macro
+     * over rt_cpu_self()->irq_nest (irq.c:68) and has no symbol - so it indexes
+     * an IRAM table of per-CPU pointers with mhartid. It cannot use a call
+     * either: IDF disables the flash cache while tuning MSPI/PSRAM timing, and a
+     * flash-resident callee faults in that window (observed: MEPC 0x40013b1e
+     * resolved to rt_enter_critical in IROM).
+     *
+     * The two builds therefore read this value differently on purpose. */
+    la    t2, rt_irq_nest_slot
+    csrr  t0, mhartid
+    slli  t0, t0, 2
+    add   t0, t0, t2
+    lw    t0, 0(t0)         /* t0 = slot[n], the address of this core's counter */
+    lw    t0, 0(t0)         /* t0 = the counter itself - the branch needs a value,
+                             * not a pointer: a pointer is never zero, so a missing
+                             * load here makes every interrupt look nested */
     bnez  t0, spurious_interrupt
 
+#ifdef RT_USING_SMP
+    /*
+     * SMP: the kernel decides and performs the switch.
+     *
+     * There is no "switch requested" flag to consult - two cores sharing one
+     * flag would race, and the MP scheduler already keeps the decision in the
+     * per-CPU structure. rt_scheduler_do_irq_switch() takes the trap frame as
+     * its argument and rt_hw_context_switch_exit restores from the stack it
+     * leaves behind, which is exactly the shape the reference port uses
+     * (interrupt_gcc.S:312-340).
+     */
+    mv    sp, sp
+    mv    a0, sp
+    call  rt_scheduler_do_irq_switch
+    tail  rt_hw_context_switch_exit
+#else
     /* Read the RT-Thread interrupt context switch flag. */
     la    s0, rt_thread_switch_interrupt_flag
     lw    s2, 0(s0)
@@ -237,6 +316,8 @@ _rtthread_nested_entry:
     la    s0, rt_interrupt_to_thread
     LOAD  s1, 0(s0)
     LOAD  sp, 0(s1)
+
+#endif /* RT_USING_SMP */
 
 spurious_interrupt:
     /* Restore the return address from the selected context for nesting or thread switching. */

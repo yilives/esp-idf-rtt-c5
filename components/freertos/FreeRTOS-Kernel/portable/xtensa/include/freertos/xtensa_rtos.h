@@ -101,7 +101,11 @@ However these can still be overridden from the command line.
 /*
 Name of RTOS (for messages).
 */
+#if CONFIG_IDF_RTOS_RTTHREAD
+#define XT_RTOS_NAME    RT-Thread
+#else
 #define XT_RTOS_NAME    FreeRTOS
+#endif
 
 /*
 Check some Xtensa configuration requirements and report error if not met.
@@ -109,7 +113,7 @@ Error messages can be customize to the RTOS port.
 */
 
 #if !XCHAL_HAVE_XEA2
-#error "FreeRTOS/Xtensa requires XEA2 (exception architecture 2)."
+#error "This Xtensa port requires XEA2 (exception architecture 2)."
 #endif
 
 
@@ -122,6 +126,36 @@ The macros are simply the function names for use in calls from assembler code.
 Some of these functions may call back to generic functions in xtensa_context.h .
 
 *******************************************************************************/
+
+#if CONFIG_IDF_RTOS_RTTHREAD
+
+/*
+ * RT-Thread definitions of the same five callouts.
+ *
+ * xtensa_vectors.S implements the entire vector table and every exception path
+ * without naming a single RTOS symbol: it reaches the OS only through these
+ * macros plus XT_RTOS_TIMER_INT and XT_RTOS_CP_STATE/XT_RTOS_CP_EXC_HOOK. That is
+ * what makes ESP-IDF's Xtensa porting layer reusable by a non-FreeRTOS kernel,
+ * and it is the reason components/rtthread/port/esp32s3 does not carry its own
+ * copy of the vectors.
+ *
+ * The implementations live in components/rtthread/port/esp32s3/context_gcc.S,
+ * which is compiled whenever CONFIG_IDF_RTOS_RTTHREAD is set on an Xtensa target.
+ *
+ * XT_RTOS_TIMER_INT is deliberately left undefined. IDF's tick comes from the
+ * SYSTIMER alarm routed through esp_intr_alloc() (port_systick.c:
+ * SysTickIsrHandler -> rt_tick_increase), not from the Xtensa CCOMPARE timer that
+ * XT_RTOS_TIMER_INT exists for. Defining it would install a second, competing tick
+ * source in every level-1 entry.
+ */
+#define XT_RTOS_INT_ENTER       _rtt_int_enter
+#define XT_RTOS_INT_EXIT        _rtt_int_exit
+#define XT_RTOS_CP_STATE        _rtt_coproc_state
+#if XCHAL_CP_NUM > 0
+#define XT_RTOS_CP_EXC_HOOK     _rtt_coproc_exc_hook
+#endif
+
+#else /* FreeRTOS definitions, unchanged */
 
 /*
 Inform RTOS of entry into an interrupt handler that will affect it.
@@ -156,7 +190,6 @@ RTOS may optionally define XT_TICK_PER_SEC in its own way (eg. macro).
 #ifdef CONFIG_FREERTOS_SYSTICK_USES_CCOUNT
 #define XT_RTOS_TIMER_INT   _frxt_timer_int
 #endif
-#define XT_TICK_PER_SEC     configTICK_RATE_HZ
 
 /*
 Return in a15 the base address of the co-processor state save area for the
@@ -179,6 +212,16 @@ The implementation may use only a2-4, a15 (all other regs must be preserved).
 #if XCHAL_CP_NUM > 0
 #define XT_RTOS_CP_EXC_HOOK   _frxt_coproc_exc_hook
 #endif
+
+#endif /* CONFIG_IDF_RTOS_RTTHREAD */
+
+/*
+Tick rate, used by the Xtensa timer callout. configTICK_RATE_HZ is still defined
+under RT-Thread because freertos/FreeRTOSConfig.h is included above unconditionally
+and CONFIG_FREERTOS_HZ is what sets it; RT-Thread's RT_TICK_PER_SECOND is asserted
+equal to it in port_systick.c.
+*/
+#define XT_TICK_PER_SEC     configTICK_RATE_HZ
 
 /*******************************************************************************
 

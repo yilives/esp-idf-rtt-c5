@@ -17,9 +17,12 @@ extern "C" {
  * The check is done at compile time; this function only exists so the linker
  * keeps the object that also carries the msh commands.
  *
- * @return 0
+ * Renamed from s31_selftest_init(): the function does no initialisation, it exists
+ * only so the linker has a reference to an object whose commands live in a data
+ * section. The declaration here was left behind by that rename, which meant this
+ * header promised a symbol that no longer existed.
  */
-int s31_selftest_init(void);
+void s31_selftest_link_anchor(void);
 
 #ifdef __cplusplus
 }

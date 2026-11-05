@@ -35,6 +35,14 @@
 #include "freertos/event_groups.h"
 #include "freertos/idf_additions.h"
 
+/* IRAM_ATTR: spi_flash calls into the scheduler API with the flash cache off. */
+#include "esp_attr.h"
+
+/* IRAM_ATTR: a few of the functions below are reachable with the flash cache
+ * off (spi_flash's cache windows call into the scheduler API), and FreeRTOS's
+ * own linker fragment puts the corresponding tasks.c functions in IRAM for
+ * exactly that reason. See xTaskGetSchedulerState() below. */
+
 #include "ft_core.h"
 
 /* The stack unit constant in ft_core.h is derived from this port's
@@ -336,25 +344,60 @@ BaseType_t xTaskCreatePinnedToCore(TaskFunction_t pxTaskCode,
 {
     static rt_uint32_t warned;
 
-    /* RT-Thread schedules on the PRO core; S31's second hart stays in reset
-     * until the SMP work lands, so there is nowhere else to put a task. */
-    if (xCoreID != tskNO_AFFINITY && xCoreID != 0)
-    {
-        ft_warn_once(&warned,
-                     "xTaskCreatePinnedToCore(core != 0): pinned tasks run on "
-                     "core 0 until SMP support lands");
-    }
-
+    /*
+     * The pinning is honoured now. It used to be folded onto core 0 with a
+     * warning, from the days when only one core was alive. With both cores
+     * running that lie is observable: esp_ipc's worker asserts
+     * `cpuid == xPortGetCoreID()` (esp_ipc.c:56), and its core-1 worker is
+     * created with xTaskCreatePinnedToCore(..., 1).
+     *
+     * The core is passed into ft_task_create rather than applied here, because
+     * the interesting tasks (esp_ipc's two workers among them) are created from
+     * constructors, before there is a scheduler to bind in. ft_task_create
+     * records the request alongside the deferred thread and applies it in
+     * ft_task_start_pending().
+     */
     void *thread = ft_task_create(pcName, pxTaskCode, pvParameters,
                                   (ft_ubase_t)usStackDepth, (ft_ubase_t)uxPriority,
-                                  (void **)pxCreatedTask);
+                                  (void **)pxCreatedTask,
+                                  (xCoreID == tskNO_AFFINITY) ? -1 : (int)xCoreID);
 
-    return (thread != RT_NULL) ? pdPASS : pdFAIL;
+    if (thread == RT_NULL)
+    {
+        return pdFAIL;
+    }
+
+    RT_UNUSED(warned);
+
+    return pdPASS;
 }
 
 TaskHandle_t xTaskGetCurrentTaskHandle(void)
 {
     return (TaskHandle_t)ft_task_self();
+}
+
+/*
+ * xTaskGetCoreID() - which core a task is running on.
+ *
+ * Newly required by the dual-core build. esp_hw_support/intr_alloc.c:933 calls
+ * it from esp_intr_free() to decide whether the handle belongs to this core,
+ * and that file is compiled on every target. With one core the comparison folds
+ * away at compile time, which is why UP never needed the symbol - measured as an
+ * "undefined reference to `xTaskGetCoreID'" the moment FREERTOS_UNICORE was
+ * cleared.
+ *
+ * FreeRTOS's contract is "the core the given task is running on, or the calling
+ * core when xTask is NULL". This port really does run tasks on both cores, so
+ * answering with the hardware core id is the honest answer rather than a stub:
+ * intr_alloc's question ("do I need to ask the other core to free this?") is
+ * answered correctly exactly when this is told the truth.
+ */
+BaseType_t xTaskGetCoreID(TaskHandle_t xTask)
+{
+    RT_UNUSED(xTask);
+
+    return (BaseType_t)rt_hw_cpu_id();
 }
 
 /* The per-core variants. Single core here, so both collapse to the plain ones -
@@ -441,7 +484,28 @@ TickType_t xTaskGetTickCountFromISR(void)
     return (TickType_t)ft_task_tick_count_isr();
 }
 
-BaseType_t xTaskGetSchedulerState(void)
+/*
+ * xTaskGetSchedulerState() - and it must live in IRAM.
+ *
+ * spi_flash/cache_utils.c calls this from
+ * spi_flash_enable_interrupts_caches_and_other_cpu(), i.e. at the exact moment
+ * the flash cache is being turned back on. FreeRTOS's own copy is placed in IRAM
+ * for that reason (components/freertos/linker.lf:90
+ * `tasks:xTaskGetSchedulerState (noflash_text)`); the shim's copy was in flash,
+ * so the first flash operation of the boot died with
+ *
+ *   Guru Meditation Error: Core 0 panic'ed (Cache error).
+ *   Cache disabled but cached memory region accessed
+ *   PC : 0x42041172   (0x42... = flash, 0x403... = IRAM)
+ *      <- cache_enable (spi_flash_os_func_app.c:81)
+ *      <- spi_flash_enable_interrupts_caches_and_other_cpu (cache_utils.c:208)
+ *      <- esp_flash_init_default_chip
+ *
+ * The call is made again at cache_utils.c:220 and :234, so this is a window
+ * entered repeatedly, not a one-off. It only started failing in the dual-core
+ * build because with CONFIG_FREERTOS_UNICORE the assert at :208 folds away.
+ */
+BaseType_t IRAM_ATTR xTaskGetSchedulerState(void)
 {
     return (BaseType_t)ft_task_scheduler_state();
 }

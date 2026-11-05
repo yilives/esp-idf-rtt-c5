@@ -18,6 +18,11 @@
 #ifndef __PORT_PWM_H__
 #define __PORT_PWM_H__
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
 #include <rtthread.h>
 
 #define S31_PWM_DEV_NAME    "pwm0"
@@ -34,5 +39,9 @@ rt_err_t rt_hw_pwm_init(void);
  * @return RT_EOK, or -RT_EINVAL when either argument is out of range
  */
 rt_err_t s31_pwm_set_pin(rt_uint32_t channel, rt_base_t pin);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* __PORT_PWM_H__ */

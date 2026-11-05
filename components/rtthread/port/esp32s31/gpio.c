@@ -30,6 +30,12 @@
 #include "soc/io_mux_reg.h"
 #include "soc/interrupts.h"
 #include "hal/gpio_ll.h"
+#include "esp_attr.h"
+#include "riscv/interrupt.h"
+#include "esp_intr_alloc.h"
+#include "esp_err.h"
+
+#include "soc/reg_base.h"
 
 #include "port_gpio.h"
 #include "port_intr.h"
@@ -110,6 +116,11 @@ static void s31_pin_mode(struct rt_device *device, rt_base_t pin, rt_uint8_t mod
         gpio_ll_od_enable(&GPIO, pin);
         /* Open drain still needs the receiver on to read the bus back. */
         gpio_ll_input_enable(&GPIO, pin);
+        /* Idle high BEFORE the driver is turned on. The output latch resets to 0,
+         * so enabling open drain first and writing a level later holds the bus
+         * low from the moment rt_pin_mode() returns - which for I2C/1-Wire looks
+         * exactly like a missing pull-up, and every transaction fails. */
+        gpio_ll_set_level(&GPIO, pin, 1);
         /* fall through */
 
     case PIN_MODE_OUTPUT:
@@ -118,6 +129,21 @@ static void s31_pin_mode(struct rt_device *device, rt_base_t pin, rt_uint8_t mod
          * leaves the pad driven by whichever peripheral was mapped last. */
         gpio_ll_set_output_signal_matrix_source(&GPIO, pin, SIG_GPIO_OUT_IDX, false);
         gpio_ll_set_output_enable_ctrl(&GPIO, (uint8_t)pin, false, false);
+        /* Keep the receiver on, exactly as the open-drain case above does.
+         *
+         * rt_pin_read() is documented as "get the level of the pin", with no
+         * restriction to input pins, and it is routine to check an output after
+         * writing it. On this SoC the input buffer is off by default, so without
+         * this line `pin write 10 high` followed by `pin read 10` reports low -
+         * measured, and it is the kind of answer that sends the reader looking for
+         * a wiring fault.
+         *
+         * This was internally inconsistent before: PIN_MODE_OUTPUT_OD enabled the
+         * receiver and PIN_MODE_OUTPUT did not, so the same "drive a pin" request
+         * behaved differently depending on open-drain. IDF models the distinction
+         * explicitly (GPIO_MODE_OUTPUT vs GPIO_MODE_INPUT_OUTPUT); the port now
+         * enables both for both, which is what RT-Thread's API assumes. */
+        gpio_ll_input_enable(&GPIO, pin);
         gpio_ll_output_enable(&GPIO, pin);
         break;
 
@@ -162,8 +188,16 @@ static const gpio_int_type_t s31_intr_type[] =
 };
 
 /* One handler for the whole port: the hardware latches per pin and the
- * dispatcher fans out from the status words. */
-static void s31_gpio_isr(int vector, void *param)
+ * dispatcher fans out from the status words.
+ *
+ * IRAM_ATTR, because this runs from an interrupt: with the cache off (any SPI
+ * flash write, or an MSPI/PSRAM operation) code fetched from .flash.text cannot
+ * be executed. Measured before the annotation: `s31test irq` produced
+ * "Interrupt wdt timeout on CPU0" with MEPC in this function as soon as PSRAM
+ * was enabled, and passed with PSRAM off. The pin callbacks it dispatches are
+ * application code and may legitimately live in flash - that is the caller's
+ * choice - but the driver's own dispatch path must not. */
+static void IRAM_ATTR s31_gpio_isr(int vector, void *param)
 {
     uint32_t lo, hi;
 
@@ -208,25 +242,149 @@ static void s31_gpio_isr(int vector, void *param)
 }
 
 /* Route, install and unmask once. The CPU line stays open afterwards; the
- * per-pin int_ena bits decide which pads can actually raise it. */
+ * per-pin int_ena bits decide which pads can actually raise it.
+ *
+ * ---------------------------------------------------------------------------
+ * The CPU line is ASKED FOR, not hardcoded, and this is the whole bug.
+ *
+ * The driver used to call rt_hw_intr_route(ETS_GPIO_INTR0_SOURCE, ETS_GPIO_INUM)
+ * with ETS_GPIO_INUM == 4, on the assumption that line 4 is "the GPIO line".
+ * It is not. Line 4 belongs to whoever the IDF interrupt allocator handed it to,
+ * and on this image that is the OS tick:
+ *
+ *   vSystimerSetup()  (freertos/port_systick.c:86)
+ *       esp_intr_alloc(ETS_SYSTIMER_TARGET0_INTR_SOURCE + cpuid, level, ...)
+ *       -> allocator picks the first usable line, which is 4
+ *
+ * `s31intr` proves it: with PSRAM on, line 4 reads back as SYSTIMER_TARGET0 with
+ * the tick's handler installed. So s31_gpio_irq_setup() was doing three things
+ * at once: re-routing the tick source off its own line, overwriting the tick's
+ * handler with s31_gpio_isr, and then unmasking. The tick stops, the scheduler
+ * stops, and the interrupt watchdog reports it - which is exactly the hang that
+ * looked like a "PSRAM bug" for three rounds.
+ *
+ * Why it looked PSRAM-specific: without PSRAM the allocator happens to give the
+ * tick a different line, so line 4 is genuinely free and the hardcoded number
+ * works by luck. With PSRAM enabled the MSPI/PSRAM setup allocates a line first,
+ * shifting everything by one, and the luck runs out.
+ *
+ * The fix is to allocate the line through the same allocator, with the same
+ * source, so the two can never collide: esp_intr_alloc() knows which lines are
+ * taken. The handler still goes through rtt_trampoline (via
+ * rt_hw_interrupt_install) so RT-Thread callers see the usual API - only the
+ * *number* comes from the allocator instead of from a #define.
+ */
+static int           s_gpio_intno = -1;
+static intr_handle_t s_gpio_intr_handle;
+
 static rt_err_t s31_gpio_irq_setup(void)
 {
+    esp_err_t err;
+
     if (s_gpio_isr_ready)
     {
         return RT_EOK;
     }
 
-    if (rt_hw_intr_route(ETS_GPIO_INTR0_SOURCE, ETS_GPIO_INUM) != 0)
+    /* Allocate with the source, not with a number: the allocator routes the
+     * matrix too, so rt_hw_intr_route() must not be called separately any more
+     * (doing both would leave the source routed twice, to two different lines).
+     *
+     * ESP_INTR_FLAG_IRAM: s31_gpio_isr is IRAM_ATTR, and the flag keeps the
+     * dispatcher from being swapped to a flash-resident path. */
+    err = esp_intr_alloc(ETS_GPIO_INTR0_SOURCE,
+                         ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_LEVEL1,
+                         rtt_trampoline, RT_NULL, &s_gpio_intr_handle);
+    if (err != ESP_OK)
     {
+        rt_kprintf("gpio: esp_intr_alloc failed 0x%x\n", (unsigned)err);
         return -RT_ERROR;
     }
 
-    rt_hw_interrupt_install(ETS_GPIO_INUM, s31_gpio_isr, RT_NULL, "gpio");
-    rt_hw_interrupt_umask(ETS_GPIO_INUM);
+    s_gpio_intno = esp_intr_get_intno(s_gpio_intr_handle);
+    if (s_gpio_intno < 0 || s_gpio_intno >= SOC_CPU_INTR_NUM)
+    {
+        rt_kprintf("gpio: allocator returned line %d\n", s_gpio_intno);
+        return -RT_ERROR;
+    }
+
+    /* Point the slot at our dispatcher, and give the line a level. install()
+     * also assigns the default level when the line is still at 0, which is the
+     * case for a freshly allocated one. */
+    rt_hw_interrupt_install(s_gpio_intno, s31_gpio_isr, RT_NULL, "gpio");
+
+    /* Ask the slot, not the return value: install() returns RT_NULL for both "no
+     * previous handler" and "vector rejected", so the result cannot tell them apart.
+     * A rejected install here would leave the pin driver registered and every
+     * rt_pin_attach_irq() silently dead. */
+    if (intr_handler_get(s_gpio_intno) == RT_NULL)
+    {
+        rt_kprintf("gpio: INUM %d did not take the handler\n", s_gpio_intno);
+        return -RT_ERROR;
+    }
+
+    rt_hw_interrupt_umask(s_gpio_intno);
 
     s_gpio_isr_ready = RT_TRUE;
+
+    rt_kprintf("gpio: irq on line %d (allocated, source %d)\n",
+               s_gpio_intno, (int)ETS_GPIO_INTR0_SOURCE);
+
     return RT_EOK;
 }
+
+/* ----------------------------------------------------------------- s31pinirq -- */
+
+/*
+ * Report the GPIO interrupt line the allocator gave us, and whether the pin
+ * channel is armed. Read-only on purpose.
+ *
+ * The earlier version of this command stepped through route/install/umask
+ * manually to bisect the PSRAM hang. It served its purpose - it showed the line
+ * was already taken - and it is gone now because reproducing the setup by hand
+ * means hardcoding a line number again, which is the bug it was meant to find.
+ */
+static int s31_pinirq_probe(rt_base_t pin)
+{
+    if (!s31_pin_valid(pin))
+    {
+        rt_kprintf("s31pinirq: pin %d invalid\n", (int)pin);
+        return -1;
+    }
+
+    if (!s_gpio_isr_ready)
+    {
+        rt_kprintf("s31pinirq: not set up yet (no pin has raised an IRQ)\n");
+        return 0;
+    }
+
+    rt_kprintf("s31pinirq: source %d -> line %d (from esp_intr_alloc)\n",
+               (int)ETS_GPIO_INTR0_SOURCE, s_gpio_intno);
+    rt_kprintf("  line ie=%u handler=%s entries=%u\n",
+               (unsigned)(rt_hw_interrupt_is_masked(s_gpio_intno) ? 0 : 1),
+               (intr_handler_get(s_gpio_intno) != RT_NULL) ? "yes" : "NO",
+               (unsigned)rt_hw_interrupt_entry_count(s_gpio_intno));
+    rt_kprintf("  pin  %d: int_ena=%u status=%u\n",
+               (int)pin,
+               (unsigned)GPIO.pin[pin].int_ena,
+
+               (unsigned)((pin < 32) ? ((GPIO.intr_0.int_0 >> pin) & 1u)
+                                     : ((GPIO.intr_01.int_01 >> (pin - 32)) & 1u)));
+
+    return 0;
+}
+static int cmd_pinirq(int argc, char **argv)
+{
+    rt_base_t pin = 10;
+
+    if (argc >= 2)
+    {
+        pin = (rt_base_t)atoi(argv[1]);
+    }
+
+    return s31_pinirq_probe(pin);
+}
+MSH_CMD_EXPORT_ALIAS(cmd_pinirq, s31pinirq, show the GPIO IRQ line and pin channel state);
 
 static rt_err_t s31_pin_attach_irq(struct rt_device *device, rt_base_t pin,
                                    rt_uint8_t mode,
@@ -383,7 +541,22 @@ static const struct rt_pin_ops s31_pin_ops =
     .pin_debounce   = s31_pin_debounce,
 };
 
-int rt_hw_pin_init(void)
+/*
+ * Register the pin device the RT-Thread way.
+ *
+ * Upstream BSPs write `INIT_BOARD_EXPORT(rt_hw_pin_init)` and never mention the
+ * function again; rt_hw_board_init() -> rt_components_board_init() walks the
+ * .rti_fn board band and calls it. This port called it by hand from board.c
+ * instead, because with --gc-sections and no reference the archive member would
+ * not otherwise be pulled in.
+ *
+ * Both halves are being restored here: the export replaces the hand call, and the
+ * return type becomes rt_err_t, which is what an RT-Thread init function returns.
+ * If the device still shows up in `list device` afterwards, the board band reaches
+ * this object on its own and every other driver can follow the same pattern.
+ */
+rt_err_t rt_hw_pin_init(void)
 {
     return rt_device_pin_register("pin", &s31_pin_ops, RT_NULL);
 }
+INIT_BOARD_EXPORT(rt_hw_pin_init);
