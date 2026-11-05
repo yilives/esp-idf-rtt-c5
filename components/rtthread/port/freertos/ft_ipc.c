@@ -20,7 +20,6 @@
 #include "ft_core.h"
 
 /* Bumped by libcpu/xtensa/cpuport.c the first time a core publishes a thread. */
-extern volatile rt_uint32_t rt_xt_running_count;
 
 enum ft_ipc_kind
 {
@@ -161,7 +160,7 @@ rt_bool_t ft_block_allowed(ft_tick_t ticks, const char *what)
      * Returning RT_FALSE makes the callers report FT_ERR_STATE, i.e. a refusal,
      * never a half-suspended thread.
      */
-    if (rt_xt_running_count == 0)
+    if (ft_port_running_count() == 0)
     {
         if (!warned)
         {
@@ -820,7 +819,7 @@ int ft_ipc_take(struct ft_ipc *ipc, ft_tick_t ticks)
      * time it publishes a thread, so it answers the real question.
      */
     if ((ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX) &&
-        rt_xt_running_count == 0)
+        ft_port_running_count() == 0)
     {
         return FT_OK;
     }
@@ -907,7 +906,7 @@ int ft_ipc_give(struct ft_ipc *ipc)
     /* The matching half of the pre-scheduler no-op in ft_ipc_take(), and it has
      * to use the same test - see the long note there. */
     if ((ipc->kind == FT_IPC_KIND_MUTEX || ipc->kind == FT_IPC_KIND_RECMUTEX) &&
-        rt_xt_running_count == 0)
+        ft_port_running_count() == 0)
     {
         return FT_OK;
     }

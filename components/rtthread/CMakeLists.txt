@@ -558,7 +558,9 @@ elseif(CONFIG_IDF_TARGET_ESP32C5)
         # main/ulp_selftest.c for that reason.
         "port/esp32c5/psram.c"
         # Pin ownership table and the conflict report. Not a driver.
-        "port/esp32c5/resources.c")
+        "port/esp32c5/resources.c"
+        # USB Serial/JTAG: the in-chip USB device controller. Pads IO13/IO14.
+        "port/esp32c5/usj.c")
 
     # The FreeRTOS-API compatibility layer, target independent - the same files
     # the S31 uses. Without this block a C5 build with
@@ -878,7 +880,7 @@ if(CONFIG_IDF_TARGET_ESP32C5)
 # linking the component alias does. Only LEDC is needed so far; i2c/spi/adc are
 # not driven on this target yet and adding their aliases would pull in hardware
 # support code that nothing here uses.
-target_link_libraries(${COMPONENT_LIB} PRIVATE idf::esp_hal_ledc idf::esp_hal_i2c idf::esp_hal_ana_conv idf::esp_hal_gpspi idf::esp_hal_twai idf::esp_hal_rmt idf::esp_hal_pcnt idf::esp_hal_mcpwm idf::esp_psram)
+target_link_libraries(${COMPONENT_LIB} PRIVATE idf::esp_hal_ledc idf::esp_hal_i2c idf::esp_hal_ana_conv idf::esp_hal_gpspi idf::esp_hal_twai idf::esp_hal_rmt idf::esp_hal_pcnt idf::esp_hal_mcpwm idf::esp_psram idf::esp_hal_usb)
 endif()
 
 if(rtt_xtensa)
@@ -893,6 +895,7 @@ if(rtt_xtensa)
 target_link_libraries(${COMPONENT_LIB} PRIVATE idf::esp_hal_ledc idf::esp_hal_i2c idf::esp_hal_gpspi
                                               idf::esp_hal_ana_conv)
 endif()
+
 
 
 

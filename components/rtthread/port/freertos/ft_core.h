@@ -497,6 +497,38 @@ typedef struct
 void      ft_timeout_set(ft_timeout_t *timeout);
 ft_base_t ft_timeout_check(ft_timeout_t *timeout, ft_tick_t *remaining);
 
+/*
+ * Has the port published a running thread yet?
+ *
+ * The Xtensa port keeps this counter (libcpu/xtensa/cpuport.c) and bumps it on
+ * every published switch; the RISC-V C5 port does not define the symbol at all,
+ * and two files in this shim read it directly, so a C5 build fails to link.
+ *
+ * Defining it here rather than guarding each use keeps the QUESTION identical on
+ * both architectures and only the SOURCE of the answer different - which is the
+ * distinction that matters. Returning `rt_thread_self() != RT_NULL` on RISC-V is
+ * exactly what the counter means on Xtensa: "the port has published a thread".
+ */
+#if defined(__XTENSA__) && defined(RT_USING_SMP)
+/* The counter is maintained by rt_xt_cpu_init()/rt_xt_stat_post_switch(), both
+ * of which live inside the Xtensa port's RT_USING_SMP block. A single-core
+ * Xtensa build compiles neither, so the symbol would sit at zero forever and
+ * every caller would be told "the scheduler has not started" - measured: the
+ * QEMU gate failed with "ulTaskNotifyTake cannot block before the scheduler
+ * starts" and the boot stopped right after the banner. Guard on BOTH, and fall
+ * back to rt_thread_self() where the counter does not exist. */
+extern volatile rt_uint32_t rt_xt_running_count;
+static inline rt_uint32_t ft_port_running_count(void)
+{
+    return rt_xt_running_count;
+}
+#else
+static inline rt_uint32_t ft_port_running_count(void)
+{
+    return (rt_thread_self() != RT_NULL) ? 1u : 0u;
+}
+#endif
+
 #ifdef __cplusplus
 }
 #endif

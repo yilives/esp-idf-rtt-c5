@@ -185,7 +185,14 @@ esp_err_t esp_ipc_call_nonblocking(uint32_t cpu_id, esp_ipc_func_t func, void* a
     }
 
     // Since it can be called from an interrupt or Scheduler is Suspened, it can not wait for a mutex to be released.
+    {
+        extern volatile unsigned int rt_xt_ip3[8];
+        rt_xt_ip3[0] = rt_xt_ip3[0] + 1u;
+        rt_xt_ip3[1] = (unsigned)s_no_block_func[cpu_id];
+        rt_xt_ip3[2] = (unsigned)xTaskGetSchedulerState();
+    }
     if (esp_cpu_compare_and_set((volatile uint32_t *)&s_no_block_func[cpu_id], 0, (uint32_t)func)) {
+        { extern volatile unsigned int rt_xt_ip3[8]; rt_xt_ip3[3] = rt_xt_ip3[3] + 1u; }
         s_no_block_func_arg[cpu_id] = arg;
         s_no_block_func_and_arg_are_ready[cpu_id] = true;
 

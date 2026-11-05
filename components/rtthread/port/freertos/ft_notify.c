@@ -168,6 +168,10 @@ int ft_task_notify(void *handle, rt_uint32_t value, ft_base_t action)
 
     /* The value update has to be atomic against an ISR notifying the same task,
      * but rt_sem_release() must run with interrupts on: it can reschedule. */
+    { extern volatile unsigned int rt_xt_nf[8];
+      rt_xt_nf[0] = rt_xt_nf[0] + 1u;
+      rt_xt_nf[1] = (unsigned)(rt_ubase_t)thread;
+      rt_xt_nf[2] = (unsigned)RT_SCHED_CTX(thread).stat; }
     level = rt_hw_interrupt_disable();
     e = ft_notify_lookup(thread, RT_TRUE);
 
@@ -210,7 +214,9 @@ int ft_task_notify(void *handle, rt_uint32_t value, ft_base_t action)
 
     if (rc == FT_OK)
     {
+        rt_xt_nf[3] = rt_xt_nf[3] + 1u;
         rt_sem_release(&e->sem);
+        rt_xt_nf[4] = (unsigned)RT_SCHED_CTX(thread).stat;
     }
 
     return rc;

@@ -37,7 +37,6 @@
 #include "ft_core.h"
 
 /* Bumped by libcpu/xtensa/cpuport.c the first time a core publishes a thread. */
-extern volatile rt_uint32_t rt_xt_running_count;
 
 #define FT_MAX_PRIORITIES   25      /* configMAX_PRIORITIES */
 #define FT_TASK_TIMESLICE   10
@@ -940,7 +939,7 @@ ft_base_t IRAM_ATTR ft_task_scheduler_state(void)
      * rt_xt_stat_post_switch), so it answers the question the caller is really
      * asking and does not depend on a field that can still be NULL.
      */
-    if (rt_xt_running_count == 0)
+    if (ft_port_running_count() == 0)
     {
         return FT_SCHEDULER_NOT_STARTED;
     }
