@@ -16,7 +16,13 @@ extern "C" {
  * SPI IO2/IO6/IO7/IO10, CAN IO4, RMT IO0, PCNT IO13, flash IO15-IO22.
  * IO1 and IO14 are unused. */
 #define C5_MCPWM_TEST_PIN_A 1
-#define C5_MCPWM_TEST_PIN_B 14
+#/* Output B is programmed (complementary pair, dead time) but NOT routed to a pad.
+ *
+ * -1 means "no pad", and rt_hw_mcpwm_set_pin() already handles it. The reason is
+ * that every usable pad on this board is taken and IO14 - the obvious choice - is
+ * the native USB D+ pad. Routing B cost nothing to verify (only A is measured) and
+ * would have put a self test on a hardware pin for no gain. */
+#define C5_MCPWM_TEST_PIN_B (-1)
 
 /* Dead time in timer ticks. At 48 MHz with prescaler 1 that is ~42 ns, well
  * below anything a real half-bridge needs - the value here is only meant to prove
@@ -39,3 +45,4 @@ int c5_mcpwm_selftest(rt_uint32_t freq_hz, rt_uint32_t duty_permille);
 #endif
 
 #endif /* PORT_MCPWM_H */
+

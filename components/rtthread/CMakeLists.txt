@@ -1,4 +1,4 @@
-# IDF discovers dependencies before Kconfig is available. Do not resolve external
+﻿# IDF discovers dependencies before Kconfig is available. Do not resolve external
 # sources during that pass; the normal pass registers nothing when disabled.
 idf_build_get_property(target IDF_TARGET)
 idf_build_get_property(non_os_build NON_OS_BUILD)
@@ -556,7 +556,9 @@ elseif(CONFIG_IDF_TARGET_ESP32C5)
         # generated shared-symbol linker script to the component that calls it, so
         # the shared variables are only visible from that component. Ours lives in
         # main/ulp_selftest.c for that reason.
-        "port/esp32c5/psram.c")
+        "port/esp32c5/psram.c"
+        # Pin ownership table and the conflict report. Not a driver.
+        "port/esp32c5/resources.c")
 
     # The FreeRTOS-API compatibility layer, target independent - the same files
     # the S31 uses. Without this block a C5 build with
@@ -891,6 +893,7 @@ if(rtt_xtensa)
 target_link_libraries(${COMPONENT_LIB} PRIVATE idf::esp_hal_ledc idf::esp_hal_i2c idf::esp_hal_gpspi
                                               idf::esp_hal_ana_conv)
 endif()
+
 
 
 
