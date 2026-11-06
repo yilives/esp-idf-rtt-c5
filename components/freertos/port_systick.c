@@ -277,21 +277,56 @@ BaseType_t xPortSysTickHandler(void)
 
 
 
-    {
-        extern volatile unsigned int rt_xt_ip3[8];
-        extern int esp_rom_printf(const char *fmt, ...);
-        static volatile int __ip3_n;
-        if ((int)xPortGetCoreID() == 1 && rt_xt_ip3[0] > 0 && __ip3_n < 3)
-        {
-            __ip3_n++;
-            {
-                extern volatile unsigned int rt_xt_nf[8];
-                esp_rom_printf("\nNF n=%u t=%08x pre=%02x rel=%u post=%02x\n",
-                               rt_xt_nf[0], rt_xt_nf[1], rt_xt_nf[2],
-                               rt_xt_nf[3], rt_xt_nf[4]);
-            }
-        }
-    }
+    /* Xtensa dual-core debugging probes (rt_xt_ip3 / rt_xt_nf / rt_xt_ii are all
+     * defined in the Xtensa port and the S3 BSP). Fourth distinct block of this
+     * kind in this one file; a RISC-V build has none of the three symbols. */
+#if defined(__XTENSA__) && (configNUM_CORES > 1)
+
+#endif /* __XTENSA__ && configNUM_CORES > 1 */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     rt_base_t level = rt_hw_local_irq_disable();
     rt_tick_increase();

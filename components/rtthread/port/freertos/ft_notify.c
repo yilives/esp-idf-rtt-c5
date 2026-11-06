@@ -168,10 +168,19 @@ int ft_task_notify(void *handle, rt_uint32_t value, ft_base_t action)
 
     /* The value update has to be atomic against an ISR notifying the same task,
      * but rt_sem_release() must run with interrupts on: it can reschedule. */
+#if defined(__XTENSA__)
+    /* Xtensa-only debug probe (rt_xt_nf lives in libcpu/xtensa/cpuport.c and in
+     * the S3 BSP's board.c). Guarded, not deleted - it is someone's active
+     * instrumentation and it is correct for the target it was written for.
+     *
+     * A previous edit in this session deleted the block outright, which would
+     * have silently disabled that instrumentation on Xtensa. Guarding keeps both
+     * targets working, which is the whole point. */
     { extern volatile unsigned int rt_xt_nf[8];
       rt_xt_nf[0] = rt_xt_nf[0] + 1u;
       rt_xt_nf[1] = (unsigned)(rt_ubase_t)thread;
       rt_xt_nf[2] = (unsigned)RT_SCHED_CTX(thread).stat; }
+#endif
     level = rt_hw_interrupt_disable();
     e = ft_notify_lookup(thread, RT_TRUE);
 
@@ -214,9 +223,15 @@ int ft_task_notify(void *handle, rt_uint32_t value, ft_base_t action)
 
     if (rc == FT_OK)
     {
+        /* The semaphore release must run; the probe around it must not exist on
+         * RISC-V. Splitting them keeps the release unconditional. */
+#if defined(__XTENSA__)
         rt_xt_nf[3] = rt_xt_nf[3] + 1u;
         rt_sem_release(&e->sem);
         rt_xt_nf[4] = (unsigned)RT_SCHED_CTX(thread).stat;
+#else
+        rt_sem_release(&e->sem);
+#endif
     }
 
     return rc;
