@@ -363,16 +363,21 @@ int c5_rmt_selftest(rt_uint32_t half_us)
      * never raised ch0_tx_end (int_raw bit 0); the only status bit set was
      * ch0_tx_thr_event (bit 8), which is the "sent more than tx_lim" threshold
      * and not an end-of-frame signal at all. */
+    /* EVERY symbol is high-then-low. The obvious "alternate the level per symbol"
+     * pattern is wrong and produced a doubled-period waveform:
+     *
+     *   sym0: H L    sym1: L H    -> H L L H H L L H ...
+     *
+     * Each level then lasts two half-periods, and the receiver - which is correct
+     * - merges the adjacent equal-level segments. Measured with that pattern: the
+     * first captured symbol was 4761/9522 and every later one 9522/9522, i.e.
+     * exactly double, which reads like an RX clock divider problem and is not.
+     *
+     * A symbol is already a pair of levels, so a clean square wave is one repeated
+     * pattern, not two alternating ones. */
     for (sym = 0; sym < 20u; sym++)
     {
-        if ((sym & 1u) == 0u)
-        {
-            c5_rmt_put(sym, ticks, 1, ticks, 0);
-        }
-        else
-        {
-            c5_rmt_put(sym, ticks, 0, ticks, 1);
-        }
+        c5_rmt_put(sym, ticks, 1, ticks, 0);
     }
 
     /* The stop pattern. Levels match the idle level so the pad does not glitch
@@ -397,9 +402,51 @@ int c5_rmt_selftest(rt_uint32_t half_us)
      * is exactly what the first version measured (write pointer advanced by 1).
      * The maximum makes the pre-transmission gap irrelevant; the frame then ends
      * on the transmitter's stop pattern instead. */
-    rmt_ll_rx_set_idle_thres(s_rmt, C5_RMT_RX_CH, 0x7FFFu);
+    /* End the received frame a few half-periods after the last edge, NOT at the
+     * 15-bit maximum.
+     *
+     * With idle_thres = 0x7FFF the receiver keeps sampling the idle line after the
+     * transmission stops and fills its whole 48-symbol buffer with padding, so the
+     * captured frame was 48 symbols of which only the first 40 pulses were real -
+     * and the mean came out 2.5x high. That reads like an RX clock-divider problem
+     * and is not: the first sixteen durations are exactly 4761/4761, the value the
+     * transmitter was given.
+     *
+     * ticks * 4 is above one half period (so a normal square wave never trips it)
+     * and far below the idle line (so the frame ends where the transmission did).
+     * The earlier attempt at this value failed only because a 1 ms printf sat
+     * between arming RX and starting TX - that gap is gone now. */
+    {
+        rt_uint32_t idle = ticks * 4u;
+
+        if (idle > 0x7FFFu)
+        {
+            idle = 0x7FFFu;
+        }
+        rmt_ll_rx_set_idle_thres(s_rmt, C5_RMT_RX_CH, idle);
+    }
     rmt_ll_rx_set_limit(s_rmt, C5_RMT_RX_CH, SOC_RMT_MEM_WORDS_PER_CHANNEL);
     rmt_ll_rx_enable_filter(s_rmt, C5_RMT_RX_CH, false);
+
+    /* TURN OFF THE RX CARRIER DEMODULATOR. It is ON out of reset.
+     *
+     * `chmconf0.carrier_en_chm` has default 1 on this chip (rmt_struct.h:156), and
+     * with it on the receiver modulates everything it samples with the carrier
+     * generator's square wave instead of passing the incoming signal through. The
+     * result is a receiver that runs, latches its frame-end, and produces nothing
+     * usable - which is exactly the symptom this driver has been reporting for
+     * three rounds.
+     *
+     * This is the SAME trap as the TX side in section 17c, where
+     * `chnconf1.carrier_en_chn` also defaults to 1 and had to be turned off
+     * explicitly. IDF does both: rmt_rx.c:279 and rmt_tx.c:330.
+     *
+     * I disabled it on TX three rounds ago and never looked for the RX
+     * counterpart, because the RX failure looked like a signal-routing problem and
+     * the TX failure had looked like a timing problem. Same silicon, same default,
+     * two different-looking bugs. */
+    rmt_ll_rx_enable_carrier_demodulation(s_rmt, C5_RMT_RX_CH, false);
+
     rmt_ll_rx_enable(s_rmt, C5_RMT_RX_CH, true);
 
     err = rt_hw_rmt_tx(20u, 50u);
@@ -412,15 +459,11 @@ int c5_rmt_selftest(rt_uint32_t half_us)
      * both give zero received symbols. Reading the TX channels read pointer and
      * the TX-done interrupt bit separates them - if the pointer moved and
      * TX_DONE fired, the pulses went out and the problem is on the RX side. */
-    rt_kprintf("c5rmt   : tx status: state=%u raddr=%u txdone=%u intraw=0x%08x\n",
-               (unsigned)s_rmt->chnstatus[C5_RMT_TX_CH].state_chn,
-               (unsigned)s_rmt->chnstatus[C5_RMT_TX_CH].mem_raddr_ex_chn,
-               (unsigned)((s_rmt->int_raw.val >> 0) & 1u),
-               (unsigned)s_rmt->int_raw.val);
-    rt_kprintf("c5rmt   : rx status: state=%u waddr=%u rxdone=%u\n",
-               (unsigned)s_rmt->chmstatus[C5_RMT_RX_CH].mem_waddr_ex_chm,
-               (unsigned)s_rmt->chmstatus[C5_RMT_RX_CH].apb_mem_raddr_chm,
-               (unsigned)((s_rmt->int_raw.val >> 2) & 1u));
+    /* The channel-status and memory-probe prints that used to sit here are gone.
+     * They were what found the four bugs above - carrier demodulator on RX, the
+     * doubled TX waveform, the printf race, and the stale-symbol read - and their
+     * shape is worth remembering: tx/rx state, both interrupt words, the memory
+     * window, and the hardware write pointer, printed once each. */
 
     if (err != RT_EOK)
     {
@@ -444,86 +487,86 @@ int c5_rmt_selftest(rt_uint32_t half_us)
      * APB window. If these are non-zero then the window works and the RX block
      * really is empty; if they are zero too, the window itself is not readable
      * and nothing about RX can be concluded from it. */
-    rt_kprintf("c5rmt   : mem probe tx[0]=0x%08x tx[1]=0x%08x rx[0]=0x%08x rx[1]=0x%08x\n",
-               (unsigned)RMTMEM.channels[C5_RMT_TX_CH].symbols[0].val,
-               (unsigned)RMTMEM.channels[C5_RMT_TX_CH].symbols[1].val,
-               (unsigned)RMTMEM.channels[C5_RMT_RX_MEM_CH].symbols[0].val,
-               (unsigned)RMTMEM.channels[C5_RMT_RX_MEM_CH].symbols[1].val);
-    rt_kprintf("c5rmt   : rx waddr(chm)=%u apb_raddr=%u\n",
-               (unsigned)s_rmt->chmstatus[C5_RMT_RX_CH].mem_waddr_ex_chm,
-               (unsigned)s_rmt->chmstatus[C5_RMT_RX_CH].apb_mem_raddr_chm);
-
-    /* Count what the RX channel captured. */
-    for (sym = 0; sym < SOC_RMT_MEM_WORDS_PER_CHANNEL; sym++)
-    {
-        rmt_symbol_word_t s;
-
-        s.val = RMTMEM.channels[C5_RMT_RX_MEM_CH].symbols[sym].val;
-
-        if (s.val == 0u)
-        {
-            break;
-        }
-
-        received++;
-        if (s.duration0)
-        {
-            pulses++;
-            sum_ticks += s.duration0;
-        }
-        if (s.duration1)
-        {
-            pulses++;
-            sum_ticks += s.duration1;
-        }
-    }
-
-    /* Decisive test: does the pad actually toggle while RMT transmits?
+    /* Read exactly as many symbols as the HARDWARE says it wrote.
      *
-     * Everything else about this driver has been checked and is correct - the
-     * symbols in RMTMEM decode to exactly the requested waveform, tx_end fires,
-     * the pad drives correctly under plain GPIO control. What is not known is
-     * whether RMT_SIG_OUT0 reaches the pin at all.
+     * "count until a zero word" is wrong: RMTMEM is not cleared between frames, so
+     * everything past the frame end is stale data from a previous run. Measured
+     * with that approach: 48 symbols returned, of which the first 19 were exactly
+     * 4761/4761 - the transmitted half period - and the rest were random
+     * durations. The mean came out 2.5x high and looked like a clock divider
+     * problem. It was stale memory.
      *
-     * So: put the channel in continuous mode, sample the pad's own input through
-     * the GPIO register a few thousand times, and count the transitions. A
-     * toggling pad means the transmitter reaches the pin and the fault is on the
-     * RX side; a static pad means the output routing is wrong. */
+     * mem_waddr_ex_chm is a channel-relative symbol address: the RX memory channel
+     * is global channel 2, whose block starts at 2 * 48 = 96. Subtracting that
+     * gives the number of symbols this frame used. The last one carries the idle
+     * gap, which is expected and is why the mean is taken over the pulses rather
+     * than over the symbols. */
     {
-        rt_uint32_t n;
-        rt_uint32_t transitions = 0;
-        rt_uint32_t prev;
+        rt_uint32_t base = (rt_uint32_t)C5_RMT_RX_MEM_CH * SOC_RMT_MEM_WORDS_PER_CHANNEL;
+        rt_uint32_t waddr = s_rmt->chmstatus[C5_RMT_RX_CH].mem_waddr_ex_chm;
+        rt_uint32_t captured = (waddr > base) ? (waddr - base) : 0u;
 
-        rmt_ll_tx_enable_loop(s_rmt, C5_RMT_TX_CH, true);
-        rmt_ll_clear_interrupt_status(s_rmt, UINT32_MAX);
-        rmt_ll_tx_reset_pointer(s_rmt, C5_RMT_TX_CH);
-        rmt_ll_tx_start(s_rmt, C5_RMT_TX_CH);
-
-        prev = gpio_ll_get_level(&GPIO, (uint8_t)C5_RMT_TEST_PIN);
-        for (n = 0; n < 20000u; n++)
+        if (captured > SOC_RMT_MEM_WORDS_PER_CHANNEL)
         {
-            rt_uint32_t now = gpio_ll_get_level(&GPIO, (uint8_t)C5_RMT_TEST_PIN);
+            captured = SOC_RMT_MEM_WORDS_PER_CHANNEL;
+        }
 
-            if (now != prev)
+        rt_kprintf("c5rmt   : hardware wrote %u symbol(s) (waddr=%u base=%u)\n",
+                   (unsigned)captured, (unsigned)waddr, (unsigned)base);
+
+        for (sym = 0; sym < captured; sym++)
+        {
+            rmt_symbol_word_t s;
+
+            s.val = RMTMEM.channels[C5_RMT_RX_MEM_CH].symbols[sym].val;
+
+            received++;
+            if (s.duration0)
             {
-                transitions++;
-                prev = now;
+                pulses++;
+                sum_ticks += s.duration0;
+            }
+            if (s.duration1)
+            {
+                pulses++;
+                sum_ticks += s.duration1;
             }
         }
-
-        rmt_ll_tx_stop(s_rmt, C5_RMT_TX_CH);
-        rmt_ll_tx_enable_loop(s_rmt, C5_RMT_TX_CH, false);
-        rmt_ll_clear_interrupt_status(s_rmt, UINT32_MAX);
-
-        rt_kprintf("c5rmt   : pad sampling during continuous TX: %u transition(s) "
-                   "in 20000 reads -> %s\n",
-                   (unsigned)transitions,
-                   transitions ? "RMT reaches the pad, fault is on the RX side"
-                               : "RMT does NOT reach the pad");
     }
-    rt_kprintf("c5rmt   : tx %u symbols, %u tick(s)/half = %u us, tick=%u ns\n",
-               (unsigned)SOC_RMT_MEM_WORDS_PER_CHANNEL,
-               (unsigned)ticks, (unsigned)half_us, (unsigned)s_rmt_tick_ns);
+
+    /* Reject only the idle-gap symbol: it is legitimately much longer than a half
+     * period and would skew the mean. Everything else is a real pulse. */
+    if (pulses != 0u)
+    {
+        sum_ticks = 0u;
+        pulses = 0u;
+        for (sym = 0; sym < received; sym++)
+        {
+            rmt_symbol_word_t s;
+            rt_uint32_t limit = ticks * 4u;
+
+            s.val = RMTMEM.channels[C5_RMT_RX_MEM_CH].symbols[sym].val;
+
+            if (s.duration0 && s.duration0 < limit)
+            {
+                pulses++;
+                sum_ticks += s.duration0;
+            }
+            if (s.duration1 && s.duration1 < limit)
+            {
+                pulses++;
+                sum_ticks += s.duration1;
+            }
+        }
+    }
+
+    /* "21 symbols" is the frame the driver BUILT: 20 square-wave symbols plus the
+     * stop pattern. Reporting SOC_RMT_MEM_WORDS_PER_CHANNEL here said 48 and made
+     * the one-to-one match with the 19 received symbols look wrong, when in fact
+     * the receiver had captured every symbol that carried an edge. */
+    rt_kprintf("c5rmt   : tx %u symbols built (20 pulses + stop), %u tick(s)/half = "
+               "%u us, tick=%u ns\n",
+               21u, (unsigned)ticks, (unsigned)half_us, (unsigned)s_rmt_tick_ns);
     rt_kprintf("c5rmt   : rx %u symbol(s), %u pulse(s), mean half = %u tick(s)\n",
                (unsigned)received, (unsigned)pulses,
                (unsigned)(pulses ? sum_ticks / pulses : 0u));
