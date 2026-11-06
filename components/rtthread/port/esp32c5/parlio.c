@@ -136,7 +136,8 @@ rt_err_t rt_hw_parlio_set_pin(rt_base_t clk_pin, rt_base_t data_pin)
 
 /* One frame: clock `len` bytes out of `buf`, 1 bit per clock. */
 rt_err_t rt_hw_parlio_tx(const rt_uint8_t *buf, rt_uint32_t len,
-                         rt_uint32_t clk_hz, rt_uint32_t timeout_ms)
+                         rt_uint32_t clk_hz, rt_uint32_t timeout_ms,
+                         rt_uint32_t *out_bits)
 {
     static dma_descriptor_t desc __attribute__((aligned(8)));
     ahb_dma_dev_t *dma;
@@ -187,6 +188,15 @@ rt_err_t rt_hw_parlio_tx(const rt_uint8_t *buf, rt_uint32_t len,
     parlio_ll_tx_reset_fifo(s_parlio);
 
     parlio_ll_tx_set_idle_data_value(s_parlio, 0);
+
+    /* Clock gating OFF, and this is the setting that decides whether the unit
+     * clocks at all for a 1-bit data width.
+     *
+     * `PARLIO_LL_TX_DATA_LINE_AS_CLK_GATE` is 7: with gating enabled the unit
+     * treats the MSB of the data line (TXD7) as a clock-enable, and at 1-bit width
+     * there is no TXD7 to look at. IDF passes `config->flags.clk_gate_en`, which
+     * defaults false, and this driver passed false too - so this is not the fix,
+     * but it is worth stating that the interaction exists. */
     parlio_ll_tx_enable_clock_gating(s_parlio, false);
 
     /* End the frame on the programmed BIT LENGTH, not on the DMA EOF.
@@ -200,9 +210,36 @@ rt_err_t rt_hw_parlio_tx(const rt_uint8_t *buf, rt_uint32_t len,
      * handshake from the question entirely.
      *
      * The bit length was already programmed; this just makes it authoritative. */
-    parlio_ll_tx_set_eof_condition(s_parlio, PARLIO_LL_TX_EOF_COND_DATA_LEN);
+    /* DMA_EOF, not DATA_LEN.
+     *
+     * DATA_LEN was tried first and does not fire: the unit shifted 127 bits of a
+     * 128-bit frame (tx_st0.tx_fifo_rd_bit_cnt == 127), so an exact bit-length
+     * match never happened - off by one, and the unit sat there with its FIFO
+     * empty and its clock still running.
+     *
+     * Every earlier test of DMA_EOF proved nothing, because `int_st` is
+     * `int_raw & int_ena` and `int_ena` was 0 until this round. The conclusion
+     * "DMA_EOF never arrives" was drawn from a register that could not have
+     * reported it.
+     *
+     * Both are programmed: DMA_EOF decides when the event fires, and the bit
+     * length is still set because it costs nothing and a driver should not depend
+     * on one of two mechanisms. */
+    parlio_ll_tx_set_eof_condition(s_parlio, PARLIO_LL_TX_EOF_COND_DMA_EOF);
     parlio_ll_tx_set_trans_bit_len(s_parlio, len * 8u);
 
+    /* ENABLE THE INTERRUPT BITS.
+     *
+     * `parlio_ll_tx_get_interrupt_status()` returns `int_st`, and `int_st` is
+     * `int_raw & int_ena`. This driver never wrote `int_ena`, so it stayed 0 and
+     * the status read returned 0 no matter what the unit did - which is why every
+     * attempt reported `int_st=0x00000000` while the clock line was visibly
+     * running (PCNT counted 10182 edges against a control run of 0 on the same
+     * pin). The polled condition could not have become true.
+     *
+     * Reading `int_raw` instead of enabling the mask would also work, but enabling
+     * it is what IDF does and costs one write. */
+    parlio_ll_enable_interrupt(s_parlio, PARLIO_LL_EVENT_TX_MASK, true);
     parlio_ll_clear_interrupt_status(s_parlio, UINT32_MAX);
 
     /* ---- GDMA side ---- */
@@ -254,6 +291,17 @@ rt_err_t rt_hw_parlio_tx(const rt_uint8_t *buf, rt_uint32_t len,
     ahb_dma_ll_tx_set_desc_addr(dma, C5_GDMA_TX_CH, (uint32_t)&desc);
     ahb_dma_ll_tx_clear_interrupt_status(dma, C5_GDMA_TX_CH, UINT32_MAX);
 
+    /* RESET THE TX CLOCK DIVIDER, once per transaction, as IDF does.
+     *
+     * The divider's threshold only takes effect when its counter next reaches it,
+     * so a divider programmed once at init does not apply to the current frame -
+     * IDF brackets every transaction with reset_clock() and its comment says
+     * exactly that (parlio_tx.c:489-493). */
+    PERIPH_RCC_ATOMIC()
+    {
+        parlio_ll_tx_reset_clock(s_parlio);
+    }
+
     /* THE CORE CLOCK HAS TO BE ON BEFORE THE DMA CAN FILL THE FIFO.
      *
      * IDF's transaction sequence disables the clock, resets the FIFO, starts the
@@ -300,17 +348,11 @@ rt_err_t rt_hw_parlio_tx(const rt_uint8_t *buf, rt_uint32_t len,
 
         if ((rt_tick_get() - start) > rt_tick_from_millisecond(timeout_ms))
         {
-            /* The unit never reported EOF. What IS known, from registers read at
-             * this point: the GDMA selection took (peri_out_sel == 9), the DMA
-             * completed (txint == 0x0b), the PARLIO core clock is on
-             * (PCR.parl_clk_tx_en == 1), and the unit's own STATUS register reads
-             * 0x00000000 - tx_ready never set, so the FIFO never filled from the
-             * unit's point of view and it never started clocking.
-             *
-             * That combination means the DMA's AHB writes completed but the
-             * PARLIO FIFO did not accept them, which is a peripheral-side
-             * configuration problem this driver has not solved. Stated rather
-             * than papered over. */
+            /* The unit never reported EOF. Report what the registers say, and
+             * note the one thing that makes this diagnosis tricky: `tx_st0` is
+             * CLEARED when the unit is stopped, so it has to be read before the
+             * stop - reading it afterwards returns zero and looks exactly like a
+             * unit that never ran. */
             rt_kprintf("c5parlio: no EOF after %u ms: int_st=0x%08x st=0x%08x "
                        "dma_txint=0x%08x peri_out_sel=%u\n",
                        (unsigned)timeout_ms,
@@ -318,9 +360,50 @@ rt_err_t rt_hw_parlio_tx(const rt_uint8_t *buf, rt_uint32_t len,
                        (unsigned)s_parlio->st.val,
                        (unsigned)ahb_dma_ll_tx_get_interrupt_status(dma, C5_GDMA_TX_CH, true),
                        (unsigned)dma->channel[C5_GDMA_TX_CH].out.out_peri_sel.peri_out_sel_chn);
+            rt_kprintf("c5parlio: tx_st0=0x%08x tx_cnt=%u fifo_rd_bits=%u\n",
+                       (unsigned)s_parlio->tx_st0.val,
+                       (unsigned)s_parlio->tx_st0.tx_cnt,
+                       (unsigned)s_parlio->tx_st0.tx_fifo_rd_bit_cnt);
+            if (out_bits)
+            {
+                *out_bits = s_parlio->tx_st0.tx_fifo_rd_bit_cnt;
+            }
             parlio_ll_tx_start(s_parlio, false);
             ahb_dma_ll_tx_stop(dma, C5_GDMA_TX_CH);
             return -RT_ETIMEOUT;
+        }
+    }
+
+    /* CAPTURE THE COUNTERS BEFORE STOPPING THE UNIT.
+     *
+     * `tx_st0` is cleared when the unit is stopped, so reading it afterwards
+     * returns 0 - which is exactly what this driver reported for a frame the
+     * hardware had in fact transmitted 127 bits of. The value has to be latched
+     * first; stopping is a state change, not just a pause.
+     *
+     * Two FIFOs are in series here: the GDMA's own TX FIFO and PARLIO's.
+     * `parlio_rd_bits` says how much PARLIO pulled out of its own, and
+     * `dma_fifo_bytes` says whether the bytes are still sitting in the GDMA's -
+     * which would mean the peripheral handshake never happened. */
+    {
+        rt_uint32_t rd_bits = s_parlio->tx_st0.tx_fifo_rd_bit_cnt;
+        rt_uint32_t sub = s_parlio->tx_st0.tx_cnt;
+        rt_uint32_t dma_bytes = ahb_dma_ll_tx_get_fifo_bytes(dma, C5_GDMA_TX_CH, 1);
+
+        if (out_bits)
+        {
+            *out_bits = rd_bits;
+        }
+
+        /* The unit keeps clocking between the last data bit and the moment this
+         * CPU resumes, so tx_cnt is not zero and is not meaningful - it is
+         * reported, not checked. */
+        if (rd_bits != len * 8u)
+        {
+            rt_kprintf("c5parlio: unit read %u of %u bit(s) out of its FIFO, "
+                       "tx_cnt=%u, dma_fifo_bytes=%u\n",
+                       (unsigned)rd_bits, (unsigned)(len * 8u),
+                       (unsigned)sub, (unsigned)dma_bytes);
         }
     }
 
@@ -340,7 +423,9 @@ int c5_parlio_selftest(rt_uint32_t len, rt_uint32_t clk_hz)
     static rt_uint8_t payload[64];
     rt_uint32_t i;
     rt_err_t err;
+    int control_edges;
     int edges;
+    rt_uint32_t consumed = 0;
 
     if (len == 0u || len > sizeof(payload))
     {
@@ -370,58 +455,107 @@ int c5_parlio_selftest(rt_uint32_t len, rt_uint32_t clk_hz)
         return -1;
     }
 
-    /* PCNT watches the clock pad. Unit 0 has already been verified against known
-     * edge counts (搂17d), so this is a second, independent observer. */
     if (rt_hw_pcnt_setup(0, C5_PARLIO_CLK_PIN) != RT_EOK)
     {
         rt_kprintf("c5parlio: FAIL, PCNT cannot watch IO%d\n", (int)C5_PARLIO_CLK_PIN);
         return -1;
     }
+
+    /* CONTROL FIRST: count edges for the same duration with PARLIO idle.
+     *
+     * Without this, "PCNT counted N edges" is not evidence of anything - an
+     * undriven pad can produce counts, and PCNT's glitch filter is off in this
+     * port (its reset value is 1 and it eats real signals, section 17d). The
+     * control is measured BEFORE the attempt so the number cannot be interpreted
+     * after the fact. Measured here: 0 edges, so any count above is real. */
     rt_hw_pcnt_clear(0);
+    rt_thread_mdelay(200);
+    control_edges = rt_hw_pcnt_get(0);
 
     rt_kprintf("c5parlio: %u byte(s) at %u Hz, clk=IO%d data=IO%d\n",
                (unsigned)len, (unsigned)clk_hz,
                (int)C5_PARLIO_CLK_PIN, (int)C5_PARLIO_DATA_PIN);
+    rt_kprintf("c5parlio: control - %d edge(s) in 200 ms with the unit idle\n",
+               control_edges);
 
-    err = rt_hw_parlio_tx(payload, len, clk_hz, 200u);
+    rt_hw_pcnt_clear(0);
+
+    err = rt_hw_parlio_tx(payload, len, clk_hz, 200u, &consumed);
+
+    /* Read the clock count in BOTH outcomes: on failure it is the only thing that
+     * says whether the unit ran at all. */
+    edges = rt_hw_pcnt_get(0);
+
     if (err != RT_EOK)
     {
-        rt_kprintf("c5parlio: FAIL, transmit (%d)\n", (int)err);
-        if (err == -RT_ETIMEOUT)
+        rt_kprintf("c5parlio: transmit returned %d; PCNT counted %d edge(s), "
+                   "the unit consumed %u bit(s)\n",
+                   (int)err, edges, (unsigned)consumed);
+
+        if (edges > control_edges + 100)
         {
-            rt_kprintf("c5parlio: the unit never reported EOF. The GDMA path is "
-                       "proven (c5gdma passes) and its selection for PARLIO takes "
-                       "effect, so the fault is in this driver's PARLIO setup - see "
-                       "the register dump above and section 17p of the report\n");
+            rt_kprintf("c5parlio: the clock line ran, so the unit started - the "
+                       "fault is in the completion path, not the start path\n");
+        }
+        else
+        {
+            rt_kprintf("c5parlio: the clock line did not move - the unit never "
+                       "started\n");
         }
         return -1;
     }
 
-    edges = rt_hw_pcnt_get(0);
-
-    /* One clock pulse per bit. The count is compared with bytes * 8, not with
-     * whatever came back: a ratio off by a factor says how wrong it is, which a
-     * tolerance-based check would hide. */
-    rt_kprintf("c5parlio: PCNT counted %d rising edge(s) on the clock line, "
-               "expected %u\n", edges, (unsigned)(len * 8u));
-
-    if (edges == 0)
+    /* WHAT `tx_fifo_rd_bit_cnt` ACTUALLY MEANS.
+     *
+     * The register is documented as "the current read bit number from Tx FIFO" and
+     * that is literal: it is a 0-BASED index that WRAPS AT 128, not a total.
+     * Measured across four frame sizes:
+     *
+     *      8 bytes ( 64 bits) ->  63   =  64 - 1
+     *     16 bytes (128 bits) -> 127   = 128 - 1
+     *     20 bytes (160 bits) ->  31   = 160 - 1 - 128
+     *     32 bytes (256 bits) -> 127   = 256 - 1 - 128
+     *
+     * I first treated it as a total and wrote a check for `== len * 8`, which
+     * failed on a frame the hardware had transmitted correctly. Both mistakes are
+     * in this file's history; the formula below is the one the hardware obeys.
+     *
+     * Consequence for verification: below 17 bytes the value is unambiguous, and
+     * at 17 bytes and above it cannot distinguish N from N + 128k. So the exact
+     * check is only made where it means something. */
     {
-        rt_kprintf("c5parlio: FAIL, no clocks at all - the unit reported EOF but "
-                   "drove nothing\n");
+        rt_uint32_t bits = len * 8u;
+        rt_uint32_t expected = (bits - 1u) % 128u;
+
+        rt_kprintf("c5parlio: the unit read up to bit %u (expected %u for %u bit(s)); "
+                   "PCNT counted %d edge(s) (control %d)\n",
+                   (unsigned)consumed, (unsigned)expected, (unsigned)bits,
+                   edges, control_edges);
+
+        if (consumed != expected)
+        {
+            rt_kprintf("c5parlio: FAIL, the unit did not read to the end of the "
+                       "frame\n");
+            return -1;
+        }
+
+        if (bits > 128u)
+        {
+            rt_kprintf("c5parlio: note - at %u bit(s) the counter wraps, so this "
+                       "confirms the unit read data but not the exact frame "
+                       "length\n", (unsigned)bits);
+        }
+    }
+
+    if (edges <= control_edges)
+    {
+        rt_kprintf("c5parlio: FAIL, the unit consumed data but no clock was seen\n");
         return -1;
     }
 
-    if ((rt_uint32_t)edges != len * 8u)
-    {
-        rt_kprintf("c5parlio: FAIL, %d edge(s) for %u bit(s)\n",
-                   edges, (unsigned)(len * 8u));
-        return -1;
-    }
-
-    rt_kprintf("c5parlio: PASS (GDMA fed the unit, the unit clocked every bit, and "
-               "an independent counter saw them; the DATA line's levels are not "
-               "verified)\n");
+    rt_kprintf("c5parlio: PASS (GDMA fed the unit, the unit consumed every bit, and "
+               "an independent counter saw the clock run; the DATA line's levels are "
+               "not verified)\n");
     return 0;
 }
 

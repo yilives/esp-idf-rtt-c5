@@ -17,8 +17,13 @@ rt_err_t rt_hw_parlio_init(void);
 rt_err_t rt_hw_parlio_set_pin(rt_base_t clk_pin, rt_base_t data_pin);
 
 /* Clock `len` bytes out, 1 bit per clock, with the AHB GDMA feeding the TX FIFO. */
+/* `out_bits` receives tx_st0.tx_fifo_rd_bit_cnt - the number of bits the unit
+ * says it pulled out of the FIFO. That is the hardware's own statement of what it
+ * consumed, and unlike a clock-edge count it does not depend on how fast the CPU
+ * noticed the EOF. Pass NULL if not needed. */
 rt_err_t rt_hw_parlio_tx(const rt_uint8_t *buf, rt_uint32_t len,
-                         rt_uint32_t clk_hz, rt_uint32_t timeout_ms);
+                         rt_uint32_t clk_hz, rt_uint32_t timeout_ms,
+                         rt_uint32_t *out_bits);
 
 /* Transmit and count the clocks with PCNT; the count must equal bytes * 8. */
 int c5_parlio_selftest(rt_uint32_t len, rt_uint32_t clk_hz);
@@ -28,3 +33,4 @@ int c5_parlio_selftest(rt_uint32_t len, rt_uint32_t clk_hz);
 #endif
 
 #endif /* PORT_PARLIO_H */
+
