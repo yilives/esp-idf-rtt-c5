@@ -348,6 +348,12 @@ set(serial_srcs
     # RT_USING_PULSE_ENCODER is on - without that macro rtdevice.h does not
     # declare struct rt_pulse_encoder_device.
     "${RTTHREAD_ROOT}/components/drivers/misc/pulse_encoder.c"
+    # CAN device class: rt_can_ops, the software RX FIFO, rt_hw_can_isr.
+    "${RTTHREAD_ROOT}/components/drivers/can/dev_can.c"
+    # dev_can.c's non-blocking TX path and its ISR use rt_ringbuffer_*, which
+    # lives in ipc/ringbuffer.c. Nothing else in this port pulled that member in,
+    # so the class compiled and the link failed on five ringbuffer symbols.
+    "${RTTHREAD_ROOT}/components/drivers/ipc/ringbuffer.c"
     # completion_* moved to components/drivers/ipc/ in 5.x; dev_serial.c's TX path
     # waits on an rt_completion. Single core -> completion_up.c.
     "${RTTHREAD_ROOT}/components/drivers/ipc/completion_up.c"
@@ -564,7 +570,9 @@ elseif(CONFIG_IDF_TARGET_ESP32C5)
         # AHB GDMA: one TX channel, memory-to-memory. PARLIO needs it.
         "port/esp32c5/gdma.c"
         # PARLIO TX: parallel output fed by GDMA, verified against PCNT.
-        "port/esp32c5/parlio.c")
+        "port/esp32c5/parlio.c"
+        # TWAI as an rt_can device (`can0`).
+        "port/esp32c5/can.c")
 
     # The FreeRTOS-API compatibility layer, target independent - the same files
     # the S31 uses. Without this block a C5 build with
@@ -623,6 +631,14 @@ endif()
 set(srcs ${kernel_srcs} ${common_srcs} ${target_srcs} ${finsh_srcs} ${serial_srcs} ${board_src})
 
 if(CONFIG_IDF_TARGET_ESP32C5)
+    # dev_can.c relies on a `/* FALLTHROUGH: ... */` comment to mark a
+    # deliberate case fall-through in rt_hw_can_isr. GCC only accepts the
+    # bare `/* fall through */` spellings at -Wimplicit-fallthrough=3, which
+    # this build enables, so upstream's marker is not recognised and the file
+    # fails on a warning. Suppressing it for this one file is narrower than
+    # changing the shared build flags.
+    set_source_files_properties("${RTTHREAD_ROOT}/components/drivers/can/dev_can.c" PROPERTIES
+        COMPILE_OPTIONS "-Wno-implicit-fallthrough;-Wno-cast-function-type")
     # i2c.c exports an `i2cscan` msh command through MSH_CMD_EXPORT_ALIAS, which
     # hits the same cast-function-type warning as finsh itself - the upstream
     # design, not a local bug. Same treatment as the S31 block below.
@@ -770,6 +786,11 @@ if(CONFIG_IDF_TARGET_ESP32C5)
     # contains no rt_hw_spi_init at all - `list device` just never shows spi0.
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_adc_init")
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_spi_init")
+    # can.c registers can0 from INIT_DEVICE_EXPORT, a data-section entry, so
+    # --gc-sections drops the member and `list device` shows no can0 - the
+    # same shape as the seven above. This one anchor also brings in `c5can`,
+    # which lives in the same archive member.
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_can_c5_init")
 endif()
 
 if(rtt_xtensa)

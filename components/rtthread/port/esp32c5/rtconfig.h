@@ -89,6 +89,9 @@
  * port/esp32c5/pcnt.c registers `pcnt0`, so rt_device_read() returns the count. */
 #define RT_USING_PULSE_ENCODER
 
+/* CAN device class: drives can0 through rt_can rather than port_twai.h. */
+#define RT_USING_CAN
+
 /* Console and shell. FINSH_USING_SYMTAB needs __fsymtab_start/__fsymtab_end and
  * the .rti_fn* table. Both are emitted by ld.flash.sections, which is shared by
  * every target and places them inside .flash.rodata - see the long comment
