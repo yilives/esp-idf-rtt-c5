@@ -63,6 +63,7 @@
 #include "port_intr.h"
 
 #include "hal/twaifd_ll.h"
+#include "hal/twai_ll.h"
 #include "soc/twaifd_struct.h"
 
 /* One device; the second controller is not brought up (port_twai.h: C5_TWAI_ID). */
@@ -552,6 +553,25 @@ int c5_can_selftest(void)
     }
 
     rt_device_close(dev);
+
+    /* HAND THE CONTROLLER BACK CLEAN.
+     *
+     * `c5can` and `c5twai` share TWAI0. Measured: running `c5can` and then
+     * `c5twai` in the same session trips
+     *
+     *     assert failed: twaifd_ll_get_rx_frame (... !hw->rx_status_rx_settings.rxmof)
+     *
+     * because the device class leaves frames in the hardware RX FIFO that its own
+     * ISR did not consume, and `c5twai` starts by resetting and then reading - only
+     * to find an overflow flag set from the previous test. Run in the other order,
+     * or alone, `c5twai` passes.
+     *
+     * Masking the interrupts and stopping the controller removes most of it.
+     * NOT `twaifd_ll_reset()`: that leaves the controller unconfigured and
+     * `c5twai` does not re-init, measured as "4 of 4 rate(s) did not round-trip" -
+     * a worse outcome than the assert it was meant to prevent. */
+    twaifd_ll_enable_intr(&TWAI0, 0);
+    rt_hw_twai_stop();
 
     rt_kprintf("c5can   : PASS (id=0x%03x, %u byte(s), round trip through `%s` at "
                "250 kbit/s; the analog layer is still unverified)\n",

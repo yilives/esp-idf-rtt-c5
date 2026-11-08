@@ -576,7 +576,9 @@ elseif(CONFIG_IDF_TARGET_ESP32C5)
         # TWAI as an rt_can device (`can0`).
         "port/esp32c5/can.c"
         # Deep sleep: what survives the HP core being powered down.
-        "port/esp32c5/lp_sleep.c")
+        "port/esp32c5/lp_sleep.c"
+        # LP I2C: the low-power domain I2C controller as `lp_i2c0`.
+        "port/esp32c5/lp_i2c.c")
 
     # The FreeRTOS-API compatibility layer, target independent - the same files
     # the S31 uses. Without this block a C5 build with
@@ -809,9 +811,11 @@ if(CONFIG_IDF_TARGET_ESP32C5)
     # same shape as the seven above. This one anchor also brings in `c5can`,
     # which lives in the same archive member.
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_can_c5_init")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_pin_init" "-u c5_probe_pads")
     # lp_sleep.c has no init function of its own - it is driven from the
     # shell and from the boot banner - so the anchor is its command.
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_lp_sleep_selftest")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_lp_i2c_selftest")
 endif()
 
 if(rtt_xtensa)

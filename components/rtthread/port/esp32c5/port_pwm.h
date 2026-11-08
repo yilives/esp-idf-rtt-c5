@@ -14,7 +14,7 @@ extern "C" {
 /* Free on this board: the console is UART0 on its default pads and the bring-up
  * image's only other pin user is the GPIO self test, which uses IO7. Not a
  * strapping pin and not a flash pad, so driving it cannot brick a boot. */
-#define C5_PWM_TEST_PIN     3
+#define C5_PWM_TEST_PIN     24
 
 rt_err_t rt_hw_pwm_init(void);
 
@@ -31,3 +31,4 @@ int c5_pwm_selftest(int pin, int hz, int duty_pct);
 #endif
 
 #endif /* PORT_PWM_H */
+

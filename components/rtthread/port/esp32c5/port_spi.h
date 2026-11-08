@@ -18,7 +18,7 @@ extern "C" {
  * in-package flash IO15-IO22. */
 #define C5_SPI0_SCLK_PIN    SPI2_IOMUX_PIN_NUM_CLK      /* 6 */
 #define C5_SPI0_MOSI_PIN    SPI2_IOMUX_PIN_NUM_MOSI     /* 7 */
-#define C5_SPI0_MISO_PIN    SPI2_IOMUX_PIN_NUM_MISO     /* 2 */
+#define C5_SPI0_MISO_PIN    23
 #define C5_SPI0_CS_PIN      SPI2_IOMUX_PIN_NUM_CS       /* 10 */
 
 /* Jumper MOSI to MISO to make this prove the data path, not just the registers. */
@@ -47,5 +47,6 @@ int c5_spi_selftest(rt_uint32_t port, rt_bool_t inside);
 #endif
 
 #endif /* PORT_SPI_H */
+
 
 

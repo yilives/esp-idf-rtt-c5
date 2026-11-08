@@ -14,8 +14,13 @@ extern "C" {
  * self-check rather than only read by a human. */
 int c5_pins_report(void);
 
+/* Which pads actually respond on this package: drive each one and read it back.
+ * A pad the package does not bring out never follows its own output. */
+int c5_probe_pads(int first, int last);
+
 #ifdef __cplusplus
 }
 #endif
 
 #endif /* PORT_RES_H */
+

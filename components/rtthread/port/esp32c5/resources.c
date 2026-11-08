@@ -33,6 +33,12 @@
 #include "soc/soc.h"
 #include "soc/soc_caps.h"
 
+#include "soc/gpio_struct.h"
+#include "soc/gpio_sig_map.h"
+#include "soc/io_mux_reg.h"
+#include "hal/gpio_ll.h"
+#include "esp_rom_gpio.h"
+
 #include "port_res.h"
 
 typedef struct
@@ -102,6 +108,66 @@ static const rt_int16_t s_adc_pin[6] = { 1, 2, 3, 4, 5, 6 };
  * sitting on a fixed-function pad. That return value is the point: this is meant
  * to be runnable from a boot self-check, not only read by a human.
  */
+/* `c5probe [first] [last]` - which pads actually respond on this package.
+ *
+ * SOC_GPIO_PIN_COUNT is 29, but a pad that the package does not bring out reads
+ * back as its pull state no matter what is written to it, and driving an
+ * unconnected pad looks identical to driving a working one. The only way to tell
+ * them apart without a meter is to drive a level and read it back through the
+ * input path: a pad that exists follows, a pad that does not never will.
+ *
+ * This is what decides where a driver can be placed. The C5's LP/RTC pads are
+ * only GPIO0..GPIO6 (rtc_io_periph.c), and this port already uses all of 0..6,
+ * so an LP peripheral needs pads freed from here. */
+int c5_probe_pads(int first, int last)
+{
+    int pin;
+    int found = 0;
+
+    if (first < 0 || last < first || last >= SOC_GPIO_PIN_COUNT)
+    {
+        first = 0;
+        last = SOC_GPIO_PIN_COUNT - 1;
+    }
+
+    rt_kprintf("c5probe : driving each pad and reading it back\n");
+
+    for (pin = first; pin <= last; pin++)
+    {
+        rt_uint32_t hi;
+        rt_uint32_t lo;
+
+        gpio_ll_func_sel(&GPIO, (uint8_t)pin, PIN_FUNC_GPIO);
+        esp_rom_gpio_connect_out_signal((uint32_t)pin, SIG_GPIO_OUT_IDX, false, false);
+        gpio_ll_set_output_enable_ctrl(&GPIO, (uint8_t)pin, false, false);
+        gpio_ll_output_enable(&GPIO, (uint8_t)pin);
+        gpio_ll_input_enable(&GPIO, (uint8_t)pin);
+        gpio_ll_pulldown_dis(&GPIO, (uint8_t)pin);
+        gpio_ll_pullup_dis(&GPIO, (uint8_t)pin);
+
+        gpio_ll_set_level(&GPIO, (uint8_t)pin, 1);
+        hi = gpio_ll_get_level(&GPIO, (uint8_t)pin);
+        gpio_ll_set_level(&GPIO, (uint8_t)pin, 0);
+        lo = gpio_ll_get_level(&GPIO, (uint8_t)pin);
+
+        if (hi == 1u && lo == 0u)
+        {
+            found++;
+            rt_kprintf("c5probe : IO%-2d follows (1 -> 1, 0 -> 0)\n", pin);
+        }
+        else
+        {
+            rt_kprintf("c5probe : IO%-2d does NOT follow (1 -> %u, 0 -> %u)\n",
+                       pin, (unsigned)hi, (unsigned)lo);
+        }
+
+        gpio_ll_output_disable(&GPIO, (uint8_t)pin);
+    }
+
+    rt_kprintf("c5probe : %d of %d pad(s) respond\n", found, last - first + 1);
+    return 0;
+}
+
 int c5_pins_report(void)
 {
     int n_pins = (int)(sizeof(s_pins) / sizeof(s_pins[0])) - 1;    /* drop sentinel */
