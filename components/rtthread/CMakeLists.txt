@@ -1,4 +1,4 @@
-﻿# IDF discovers dependencies before Kconfig is available. Do not resolve external
+# IDF discovers dependencies before Kconfig is available. Do not resolve external
 # sources during that pass; the normal pass registers nothing when disabled.
 idf_build_get_property(target IDF_TARGET)
 idf_build_get_property(non_os_build NON_OS_BUILD)
@@ -494,6 +494,8 @@ elseif(CONFIG_IDF_TARGET_ESP32S31)
         "port/esp32s31/smp_cmd.c"
         "port/esp32s31/console_probe.c"
         "port/esp32s31/usb_probe.c"
+        "port/esp32s31/lp_core.c"
+        "port/esp32s31/sleep.c"
         )
     # FreeRTOS-compatible primitives on rt_*. Target independent, but only S31
     # needs them today; they exist so the IDF components that call FreeRTOS APIs
@@ -572,7 +574,9 @@ elseif(CONFIG_IDF_TARGET_ESP32C5)
         # PARLIO TX: parallel output fed by GDMA, verified against PCNT.
         "port/esp32c5/parlio.c"
         # TWAI as an rt_can device (`can0`).
-        "port/esp32c5/can.c")
+        "port/esp32c5/can.c"
+        # Deep sleep: what survives the HP core being powered down.
+        "port/esp32c5/lp_sleep.c")
 
     # The FreeRTOS-API compatibility layer, target independent - the same files
     # the S31 uses. Without this block a C5 build with
@@ -670,6 +674,8 @@ if(CONFIG_IDF_TARGET_ESP32S31)
                             "port/esp32s31/smp_cmd.c"
                             "port/esp32s31/console_probe.c"
                             "port/esp32s31/usb_probe.c"
+                            "port/esp32s31/lp_core.c"
+                            "port/esp32s31/sleep.c"
 
                             "port/esp32s31/gptimer.c"
                             "port/esp32s31/pwm.c"
@@ -700,14 +706,26 @@ idf_component_register(SRCS ${srcs}
     # (rtconfig.h) and cpuport.h / rt_hw_stack_frame.h from upstream libcpu.
     INCLUDE_DIRS "${RTTHREAD_ROOT}/include" "${RTTHREAD_ROOT}/components/finsh"
                  "${RTTHREAD_ROOT}/components/drivers/include" "${rtt_config_dir}"
+    # The last three are ulp's, named directly.
+    #
+    # PRIV_REQUIRES ulp alone was not enough: the dependency was recorded (ulp
+    # appears in build_components, and the include count on lp_core.c's compile
+    # line went 42 -> 59) but ulp/lp_core/include was still absent, so
+    # lp_core.c could not find ulp_lp_core.h. The reason is that ulp's own
+    # INCLUDE_DIRS are conditional on CONFIG_ULP_COPROC_ENABLED at the moment it
+    # registers, and this component registers before that resolves. Naming the
+    # directories is explicit and does not depend on that ordering.
     PRIV_INCLUDE_DIRS "${rtt_riscv_port_dir}" "${IDF_PATH}/components/freertos"
                       "${CMAKE_CURRENT_LIST_DIR}/port/freertos"
+                      "${IDF_PATH}/components/ulp/lp_core/include"
+                      "${IDF_PATH}/components/ulp/lp_core/shared/include"
+                      "${IDF_PATH}/components/ulp/ulp_common/include"
     # esp_hw_support: port/esp32c5/gpio.c calls esp_intr_alloc(), which lives in
     # esp_hw_support/intr_alloc.c. It is not part of the `hal` umbrella, so it has
     # to be named; without it the gpio object fails with "esp_intr_alloc.h: No
     # such file or directory".
     PRIV_REQUIRES freertos riscv esp_rom soc hal esp_hal_uart esp_hal_gpio
-                  esp_hw_support esp_hal_i2c esp_hal_systimer heap
+                  esp_hw_support esp_hal_i2c esp_hal_systimer heap ulp
     LDFRAGMENTS "linker.lf")
 endif()
 
@@ -791,6 +809,9 @@ if(CONFIG_IDF_TARGET_ESP32C5)
     # same shape as the seven above. This one anchor also brings in `c5can`,
     # which lives in the same archive member.
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_can_c5_init")
+    # lp_sleep.c has no init function of its own - it is driven from the
+    # shell and from the boot banner - so the anchor is its command.
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_lp_sleep_selftest")
 endif()
 
 if(rtt_xtensa)
@@ -860,6 +881,36 @@ target_link_libraries(${COMPONENT_LIB} INTERFACE "-u s31_cpu1_report")
 # Measured: adding the file to target_srcs alone was not enough; the command appeared only
 # after this line was added.
 target_link_libraries(${COMPONENT_LIB} INTERFACE "-u cmd_usb")
+
+# Deep sleep, for the experiment of whether it links as-is.
+#
+# sleep_modes.c compiles today and all 43 of its undefined symbols exist as object
+# files in the build tree, but nothing in the RT-Thread image references any of
+# them, so --gc-sections drops the whole graph. Anchoring one entry point pulls in
+# whatever it actually needs, which turns "would deep sleep link?" from a guess
+# into a link error or the absence of one.
+if(CONFIG_RTT_SLEEP_LINK_PROBE)
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u esp_deep_sleep_start")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u esp_sleep_enable_timer_wakeup")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u esp_sleep_get_wakeup_cause")
+
+    # The LP core launcher, same question: does it link with no glue?
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u ulp_lp_core_run")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u ulp_lp_core_load_binary")
+endif()
+
+# The two new shell commands are single MSH entries and nothing references them.
+# Same reason as cmd_usb above: without these the objects are dropped and the
+# commands report "not found" even though their sources compiled.
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-u cmd_lp")
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-u cmd_sleep")
+
+# sleep.c's INIT_APP_EXPORT writes a separate record, __rt_init_s31_sleep_report.
+# Anchoring cmd_sleep pulls the object in but does not force that record into the
+# table: measured, cmd_sleep was present in the ELF while the init entry was not,
+# so `s31sleep` would report a previous cycle but the boot-time report would never
+# run. One -u per record.
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-u __rt_init_s31_sleep_report")
 
 # INIT_BOARD_EXPORT / INIT_DEVICE_EXPORT need the archive member to be pulled in,
 # and on this build it is not: measured, `rt_hw_pin_init` was absent from the image

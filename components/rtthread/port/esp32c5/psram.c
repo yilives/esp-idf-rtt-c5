@@ -130,9 +130,31 @@ int c5_psram_selftest(rt_uint32_t test_kb)
         return 0;
     }
 
-    if (test_kb > 1024u)
+    /* Cap at what the chip actually reports, not at a hard-coded 1 MB.
+     *
+     * The old cap was silently clamping `c5psram test 7680` to 1024 KB and then
+     * printing "wrote and read back 1048576 byte(s)" - so the test looked like it
+     * had honoured the request while only exercising an eighth of the part. That
+     * is the same class of mistake this report keeps recording: a limit nobody
+     * stated, producing a pass that means less than it appears to.
+     *
+     * Leave a margin for the allocator's own bookkeeping and for whatever else has
+     * already been allocated from the same heap. */
     {
-        test_kb = 1024u;
+        rt_uint32_t max_kb = (total / 1024u);
+
+        if (max_kb > 64u)
+        {
+            max_kb -= 64u;
+        }
+
+        if (test_kb > max_kb)
+        {
+            rt_kprintf("c5psram : %u KB requested, clamping to %u KB (the chip "
+                       "reports %u KB)\n",
+                       (unsigned)test_kb, (unsigned)max_kb, (unsigned)(total / 1024u));
+            test_kb = max_kb;
+        }
     }
 
     {
