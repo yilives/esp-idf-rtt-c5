@@ -48,7 +48,7 @@ measurement rather than "OK".
 | PWM | `c5pwm` | frequency and duty measured at the pad, 1 Hz – 40 kHz |
 | I2C | `i2cscan` | NACK and timeout counters, not a device count |
 | SPI | `c5spiloop` | byte-identical loopback through the real data path |
-| ADC | `c5adc` | all 6 channels converted, calibrated by eFuse |
+| ADC | `c5adc` | all 6 channels converted; **millivolts from eFuse curve fitting** |
 | CAN (TWAI) | `c5can`, `c5twai` | loopback at 125k/250k/500k/1M **and** as an `rt_can` device |
 | RMT | `c5rmt` | TX waveform measured back by RX: 19 symbols, mean half 4761 ticks |
 | MCPWM | `c5mcpwm` | complementary pair + dead time, measured at the pad |
@@ -89,7 +89,7 @@ useful to the next person.
 | **`rt_malloc()` → PSRAM** | the 8 MB is in IDF's `heap_caps` heap only; RT-Thread's allocator is still 65 KB. Bridging them is a design decision, not a bug. |
 | **PARLIO RX** | TX only |
 | **Analog layer** | no transceiver for CAN, no scope for MCPWM dead time, no host for USB |
-| **ADC in volts** | raw codes only, `get_vref()` returns 0 |
+| **ADC accuracy** | millivolts are computed, but accuracy against a reference is not measured |
 
 ---
 
@@ -297,6 +297,7 @@ Each of these is one line in the report and hours on the board.
 * **Clock sources default to a PLL nobody enabled.** ADC, TWAI, RMT, LEDC and PARLIO all had to be pointed at XTAL explicitly.
 * **`int_st` is masked.** `int_ena` reads 0 out of reset, so a polling driver that waits on `int_st` waits forever. Read `int_raw`. This cost a complete round on PARLIO.
 * **A lost edit is invisible until the path it fixes runs again.** The `locks.c` ISR fix was silently reverted and stayed invisible for three rounds.
+* **`--gc-sections` also drops code nothing references.** The ADC calibration component was compiled and linked into every image and then discarded, because nothing called it - `nm` on the final ELF found no `adc_cali` symbols while `libesp_adc.a` had them. `-u` in `target_link_libraries` is the fix, for a whole feature and not just for drivers.
 * **Never rewrite an important file with `open(..., "w")`.** The report was truncated to zero bytes once that way.
 
 ---
