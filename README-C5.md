@@ -86,7 +86,7 @@ useful to the next person.
 
 | | status |
 |---|---|
-| **LP I2C** | controller is reachable, both clocks read enabled, pads handed over, **the FSM never starts**. See [the report §17t](docs/PORTING-REPORT.md). |
+| **LP I2C** | controller reachable, both clocks enabled, pads handed over, **the FSM never starts**. **IDF's own driver works on the same board** (§17y), so the fault is in this port's driver; six candidate differences are eliminated. |
 | **LP UART / LP peripherals** | not attempted — blocked on the same unknown as LP I2C |
 | **SDIO slave** | needs a host on the other end |
 | ~~`rt_malloc()` → PSRAM~~ | **done**: a `psram` memheap with auto-binding; 4 MB allocated, written and read back |
@@ -331,6 +331,33 @@ the systimer instead reads 0 ms.
 
 **Not proven:** the absence of a leak (a few bytes per hour is invisible to a two
 minute run), any driver or radio soak, and thermal drift.
+
+## The LP I2C question, and how it was narrowed
+
+`c5lpi2c` drives the low-power I2C controller by hand and the FSM never starts:
+registers readable, both clocks enabled, pads idling high, command words well
+formed, and `int_raw` empty. Thirty rounds of that looked like hardware.
+
+It is not. **ESP-IDF's own LP I2C driver works on the same board**, same pads,
+same registers:
+
+```
+c5lpi2cidf: i2c_master_transmit to 0x7F -> 0x108 (NACK - the bus WAS driven)
+```
+
+`0x108` is `ESP_ERR_INVALID_RESPONSE` = "master transmit receives NACK", and a NACK
+from a reserved address is the success case: a start condition went out and nine
+bits were clocked.
+
+Six differences were then found and removed — command packing, the extra `END`
+command, FIFO/command order, watermark values, when timing is applied, and two
+missing LL calls — and **none of them fixed it**. That is recorded rather than
+hidden: the next candidate is the LP-domain clock select, and it is named as a
+hypothesis, not a finding.
+
+The comparison also found a real defect in this port: `i2c_del_master_bus()`
+panics with `assert failed: vSemaphoreDeleteWithCaps` because the FreeRTOS shim's
+semaphore wrapper refuses a delete it did not hand out.
 
 ## The pre-build guard check
 
