@@ -57,6 +57,7 @@ measurement rather than "OK".
 | AHB GDMA | `c5gdma` | mem-to-mem byte-exact at 1/16/128/256 B, no overrun |
 | PARLIO | `c5parlio` | GDMA feeds it, unit consumes every bit, PCNT sees the clock |
 | PSRAM | `c5psram test 7000` | 7 MB written and read back byte-exact |
+| `rt_malloc()` | `c5heap` | small blocks stay in SRAM, 4 MB lands in PSRAM, contents verified |
 | LP core | `c5ulp` | LP program runs, shares variables, checksum verified |
 | Deep sleep | `c5sleep 3` | timer wake works; **PSRAM does not survive it** |
 | USB Serial/JTAG | `c5usj` | device side only; no host, so no enumeration |
@@ -86,10 +87,11 @@ useful to the next person.
 | **LP I2C** | controller is reachable, both clocks read enabled, pads handed over, **the FSM never starts**. See [the report §17t](docs/PORTING-REPORT.md). |
 | **LP UART / LP peripherals** | not attempted — blocked on the same unknown as LP I2C |
 | **SDIO slave** | needs a host on the other end |
-| **`rt_malloc()` → PSRAM** | the 8 MB is in IDF's `heap_caps` heap only; RT-Thread's allocator is still 65 KB. Bridging them is a design decision, not a bug. |
+| ~~`rt_malloc()` → PSRAM~~ | **done**: a `psram` memheap with auto-binding; 4 MB allocated, written and read back |
 | **PARLIO RX** | TX only |
 | **Analog layer** | no transceiver for CAN, no scope for MCPWM dead time, no host for USB |
 | **ADC accuracy** | millivolts are computed, but accuracy against a reference is not measured |
+| **PSRAM under DMA** | the SPI DMA path to PSRAM is not exercised; `c5gdma` uses internal RAM |
 
 ---
 
@@ -250,6 +252,34 @@ are `-1`. LP I2C is fixed to IO2/IO3 by `i2c_ll.h`, which is why SPI and PWM had
 to move — they are re-routable, LP I2C is not.
 
 ---
+
+## Two heaps, and why not one
+
+`rt_malloc()` reaches the 8 MB through a second memheap named `psram`, with
+`RT_USING_MEMHEAP_AUTO_BINDING` so a request the 65 KB system heap cannot satisfy
+falls through to it.
+
+```
+msh > free
+memheap       pool size  max used size available size
+psram        8126464    64            8126400
+heap         65536      33504         32032
+```
+
+**This requires `RT_USING_MEMHEAP_AS_HEAP`, not `RT_USING_SMALL_MEM_AS_HEAP`.**
+`kservice.c` selects the allocator with `#if SMALL_MEM_AS_HEAP / #elif
+MEMHEAP_AS_HEAP`, and the walk over "every other memheap" lives inside
+`_memheap_alloc()`, which only exists in the MEMHEAP branch. With small-mem as
+the heap, registering a second memheap does nothing and nothing warns.
+
+The cost is a ~40-byte header per allocation in the 65 KB region. The alternative
+- one merged pool - has to pick one allocator for both regions, and both choices
+are wrong: small-mem over PSRAM pays the SPI-cache penalty on every access;
+memheap over 65 KB spends the tightest resource on headers.
+
+`c5heap` asserts both directions and checks contents with a position-dependent
+pattern. **Not proven:** DMA to PSRAM (needs `esp_cache_msync()` around every
+transfer, and nothing here does that yet).
 
 ## The pre-build guard check
 
