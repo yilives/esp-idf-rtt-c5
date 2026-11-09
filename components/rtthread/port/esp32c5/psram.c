@@ -74,6 +74,63 @@ rt_uint32_t rt_hw_psram_size(void)
     return (rt_uint32_t)esp_psram_get_size();
 }
 
+/* Claim one large PSRAM block and hand it to RT-Thread.
+ *
+ * This is the bridge `rt_malloc()` needed, and the design is deliberate:
+ *
+ *   - ONE `heap_caps_malloc` for the whole usable region, taken at init and
+ *     never freed. Going through the IDF allocator once, up front, means the
+ *     two allocators never interleave - RT-Thread owns the block outright and
+ *     IDF's heap simply records it as used.
+ *
+ *   - The size is what the allocation actually returned, not the chip's
+ *     reported capacity. The IDF heap needs its own metadata out of the same
+ *     region, and a request for the full 8 MB fails: measured,
+ *     `heap_caps_malloc(8294400)` returns NULL while 7168000 succeeds.
+ *
+ *   - If the allocation fails the function returns NULL and the caller leaves
+ *     the system heap alone. A 65 KB heap that works is better than a merged
+ *     one that does not. */
+void *rt_hw_psram_claim(rt_uint32_t *out_size)
+{
+    rt_uint32_t want;
+    void *p;
+
+    if (out_size != RT_NULL)
+    {
+        *out_size = 0;
+    }
+
+    if (!esp_psram_is_initialized())
+    {
+        return RT_NULL;
+    }
+
+    /* Leave a margin: the IDF heap's own bookkeeping and any earlier stray
+     * allocation come out of the same region. */
+    want = (rt_uint32_t)esp_psram_get_size();
+    if (want > C5_PSRAM_HEAP_RESERVE)
+    {
+        want -= C5_PSRAM_HEAP_RESERVE;
+    }
+    want &= ~0xFFFu;                 /* whole pages; the mapping is page based */
+
+    p = heap_caps_malloc(want, MALLOC_CAP_SPIRAM);
+    while (p == RT_NULL && want > (1u << 20))
+    {
+        want >>= 1;                  /* halve until it fits, and say how much */
+        want &= ~0xFFFu;
+        p = heap_caps_malloc(want, MALLOC_CAP_SPIRAM);
+    }
+
+    if (p != RT_NULL && out_size != RT_NULL)
+    {
+        *out_size = want;
+    }
+
+    return p;
+}
+
 /* ------------------------------------------------------------------ msh -- */
 
 static rt_uint32_t c5_psram_crc32(const rt_uint8_t *p, rt_uint32_t len)
@@ -230,6 +287,89 @@ int c5_psram_selftest(rt_uint32_t test_kb)
                "executable memory, and RT-Thread's own heap does not use it)\n");
     return 0;
 }
+
+/* ------------------------------------------------------------------ heap -- */
+
+#if defined(RT_USING_MEMHEAP)
+
+/* The block claimed for RT-Thread, and the heap object that owns it. */
+static struct rt_memheap s_psram_heap;
+static void             *s_psram_block;
+static rt_uint32_t       s_psram_block_size;
+
+rt_bool_t rt_hw_psram_heap_ready(void)
+{
+    return (s_psram_block != RT_NULL) ? RT_TRUE : RT_FALSE;
+}
+
+rt_uint32_t rt_hw_psram_heap_size(void)
+{
+    return s_psram_block_size;
+}
+
+/* Register the claimed block as a memheap named "psram".
+ *
+ * With RT_USING_MEMHEAP_AS_HEAP + RT_USING_MEMHEAP_AUTO_BINDING, `rt_malloc()`
+ * tries the system heap first and then every other memheap in the object list -
+ * so registering this one is what makes small allocations keep coming from the
+ * fast internal SRAM while large ones spill into PSRAM. That is the behaviour
+ * that is actually wanted here: internal SRAM is 65 KB and cache-coherent, PSRAM
+ * is 8 MB and goes through the SPI cache on every access.
+ *
+ * Nothing is merged into a single pool on purpose. A merged pool would have to
+ * pick one allocator for both, and either choice is wrong: small-mem over PSRAM
+ * pays the cache penalty on every allocation, and memheap over internal SRAM
+ * costs 40 bytes of header per allocation in a 65 KB region. */
+rt_err_t rt_hw_psram_heap_init(void)
+{
+    if (s_psram_block != RT_NULL)
+    {
+        return RT_EOK;
+    }
+
+    s_psram_block = rt_hw_psram_claim(&s_psram_block_size);
+
+    if (s_psram_block == RT_NULL || s_psram_block_size < (256u * 1024u))
+    {
+        s_psram_block = RT_NULL;
+        s_psram_block_size = 0;
+        return -RT_ERROR;
+    }
+
+    if (rt_memheap_init(&s_psram_heap, "psram", s_psram_block,
+                        s_psram_block_size) != RT_EOK)
+    {
+        s_psram_block = RT_NULL;
+        s_psram_block_size = 0;
+        return -RT_ERROR;
+    }
+
+    /* The system heap takes its own lock; this one is a plain memheap and needs
+     * the same treatment, otherwise two threads can corrupt it. */
+    s_psram_heap.locked = RT_TRUE;
+
+    return RT_EOK;
+}
+
+/* Register the PSRAM heap at board stage.
+ *
+ * INIT_BOARD_EXPORT runs after the kernel heap exists (rt_system_heap_init is at
+ * the very start of rt_hw_board_init) and before any device or application
+ * thread allocates, which is the only window where adding a heap is safe: an
+ * allocation made before this point that later has to be freed would still be
+ * found, because rt_memheap_free() walks to the owning pool - but a thread that
+ * started earlier could have already failed a large request.
+ *
+ * The -u anchor in CMakeLists is required for the same reason as everywhere else
+ * in this port: an INIT_*_EXPORT entry is data, and --gc-sections drops members
+ * nothing references by symbol. */
+rt_err_t rt_hw_psram_heap_auto_init(void)
+{
+    return rt_hw_psram_heap_init();
+}
+INIT_BOARD_EXPORT(rt_hw_psram_heap_auto_init);
+
+#endif /* RT_USING_MEMHEAP */
 
 #endif /* SOC_SPIRAM_SUPPORTED */
 

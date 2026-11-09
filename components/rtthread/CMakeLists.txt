@@ -150,6 +150,11 @@ set(kernel_srcs
     "${RTTHREAD_ROOT}/src/irq.c"
     "${RTTHREAD_ROOT}/src/kservice.c"
     "${RTTHREAD_ROOT}/src/mem.c"
+    # memheap.c: the second allocator (`psram`), and the one the system heap
+    # itself uses once RT_USING_MEMHEAP_AS_HEAP is on. Upstream compiles it
+    # from SConscript only when RT_USING_MEMHEAP is set; this list is
+    # unconditional, so the guard inside the file does the work.
+    "${RTTHREAD_ROOT}/src/memheap.c"
     # mempool.c defines rt_mp_create()/rt_mp_alloc()/rt_mp_free(). It is a
     # separate translation unit from mem.c and is only compiled by upstream's
     # SConscript when RT_USING_MEMPOOL is on, which is the Kconfig default - so
@@ -579,7 +584,9 @@ elseif(CONFIG_IDF_TARGET_ESP32C5)
         # Deep sleep: what survives the HP core being powered down.
         "port/esp32c5/lp_sleep.c"
         # LP I2C: the low-power domain I2C controller as `lp_i2c0`.
-        "port/esp32c5/lp_i2c.c")
+        "port/esp32c5/lp_i2c.c"
+        # Heap routing: proves rt_malloc() reaches PSRAM for large blocks.
+        "port/esp32c5/heap.c")
 
     # The FreeRTOS-API compatibility layer, target independent - the same files
     # the S31 uses. Without this block a C5 build with
@@ -812,6 +819,8 @@ if(CONFIG_IDF_TARGET_ESP32C5)
     # same shape as the seven above. This one anchor also brings in `c5can`,
     # which lives in the same archive member.
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_can_c5_init")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_psram_heap_auto_init")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_heap_selftest")
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_pin_init" "-u c5_probe_pads")
     # lp_sleep.c has no init function of its own - it is driven from the
     # shell and from the boot banner - so the anchor is its command.

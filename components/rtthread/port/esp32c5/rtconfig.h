@@ -38,7 +38,27 @@
  * itself comes from IDF_RTTHREAD_HEAP_SIZE (__heap_start__/__heap_end__). */
 #define RT_USING_HEAP
 #define RT_USING_SMALL_MEM
-#define RT_USING_SMALL_MEM_AS_HEAP
+/* MEMHEAP as the system heap, with AUTO_BINDING: THIS IS THE ONLY COMBINATION
+ * that gives rt_malloc() a fallback.
+ *
+ * Measured constraint, not a preference: `kservice.c:1043-1083` selects the
+ * allocator with `#if SMALL_MEM_AS_HEAP / #elif MEMHEAP_AS_HEAP / #elif
+ * SLAB_AS_HEAP`, and `_memheap_alloc()`'s walk over "every other memheap" lives
+ * inside the MEMHEAP_AS_HEAP branch. With SMALL_MEM_AS_HEAP set, registering a
+ * second memheap for the PSRAM does nothing at all - the object appears in the
+ * list and rt_malloc() never looks at it.
+ *
+ * The cost is real and is the trade being made: the 65 KB internal region now
+ * goes through memheap instead of small-mem, so every allocation carries a
+ * ~40-byte header instead of a few bytes. In exchange, a `rt_malloc(4 MB)`
+ * succeeds instead of returning NULL, and the 8 MB becomes usable through the
+ * standard API rather than a bespoke one.
+ *
+ * RT_USING_SMALL_MEM stays defined: small-mem is still compiled and still what
+ * `rt_smem_*` users get, it is simply no longer the system heap. */
+#define RT_USING_MEMHEAP
+#define RT_USING_MEMHEAP_AS_HEAP
+#define RT_USING_MEMHEAP_AUTO_BINDING
 #define RT_USING_SEMAPHORE
 #define RT_USING_MUTEX
 /* Event groups. port/freertos/ft_event.c maps xEventGroup* onto rt_event, and
