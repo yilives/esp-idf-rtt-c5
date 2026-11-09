@@ -59,6 +59,7 @@ measurement rather than "OK".
 | PSRAM | `c5psram test 7000` | 7 MB written and read back byte-exact |
 | `rt_malloc()` | `c5heap` | small blocks stay in SRAM, 4 MB lands in PSRAM, contents verified |
 | DMA → PSRAM | `c5dma` | byte-exact both directions; **fails without cache flush/invalidate** |
+| Kernel soak | `c5soak 2000 1` | 2000 rounds: both heaps flat, tick vs hardware clock within 1 ms |
 | LP core | `c5ulp` | LP program runs, shares variables, checksum verified |
 | Deep sleep | `c5sleep 3` | timer wake works; **PSRAM does not survive it** |
 | USB Serial/JTAG | `c5usj` | device side only; no host, so no enumeration |
@@ -307,6 +308,29 @@ and a request small enough to fit the 65 KB system heap will land in SRAM — so
 **Not proven:** a peripheral streaming into PSRAM while the CPU reads behind it.
 That needs the lines around the read pointer invalidated as the transfer
 advances, and it cannot be exercised without a real producer.
+
+## Soak testing
+
+```
+msh > c5soak 2000 1
+c5soak  : tick advanced 145999 ms, hardware clock advanced 145999 ms, difference 0 ms
+c5soak  : internal heap used 17088 -> 17088 (worst 17088), tolerance 512
+c5soak  : PSRAM free 8126400 -> 8126400 (worst 8126400), tolerance 65536
+c5soak  : PASS
+```
+
+Four metrics, because one hides three failures: `used` at the end of each round,
+`used` **worst** over the run, the tick against **`esp_timer_get_time()`** (an
+independent hardware clock), and thread/semaphore churn.
+
+**The clock matters.** The first version compared the tick against
+`rounds * delay_ms` and reported 1439 ms of drift on a 1479 ms run — but each
+round also creates threads and memsets 512 KB, none of which is sleep. It was
+measuring the test's own work and calling it a scheduler fault. Comparing against
+the systimer instead reads 0 ms.
+
+**Not proven:** the absence of a leak (a few bytes per hour is invisible to a two
+minute run), any driver or radio soak, and thermal drift.
 
 ## The pre-build guard check
 
