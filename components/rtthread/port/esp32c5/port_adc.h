@@ -18,6 +18,10 @@ extern "C" {
 rt_err_t rt_hw_adc_init(void);
 
 /* Read every channel; returns 0 on PASS. */
+/* Raw code -> millivolts through the eFuse curve-fitting calibration.
+ * Returns -RT_ERROR when no calibration data is available, rather than a guess. */
+rt_err_t rt_hw_adc_raw_to_mv(rt_int8_t channel, rt_uint32_t raw, rt_int32_t *mv);
+
 int c5_adc_selftest(void);
 
 #ifdef __cplusplus
@@ -25,3 +29,4 @@ int c5_adc_selftest(void);
 #endif
 
 #endif /* PORT_ADC_H */
+

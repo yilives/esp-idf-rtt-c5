@@ -525,10 +525,11 @@ elseif(CONFIG_IDF_TARGET_ESP32C5)
     # port/esp32c5 differ only in the SoC name and in the two trap-path tables
     # cpuport.c has to define for a single-core build.
     #
-    # gpio.c, pwm.c, i2c.c, spi.c and adc.c are deliberately absent: they are
-    # written against the S31's LL headers and pin maps and have not been brought
-    # up here. `list device` therefore shows uart0 and pin only, which is the
-    # honest state of this port.
+    # gpio.c, pwm.c, i2c.c, spi.c and adc.c were absent in the first version,
+    # because they were written against the S31's LL headers and pin maps. They
+    # have since been brought up here, along with TWAI, RMT, PCNT, MCPWM, the
+    # temperature sensor, PSRAM, USB Serial/JTAG, AHB GDMA and PARLIO; `list
+    # device` now shows eight devices. The list below is the current one.
     set(target_srcs
         "port/esp32c5/cpuport.c"
         "port/esp32c5/interrupt.c"
@@ -960,7 +961,19 @@ if(CONFIG_IDF_TARGET_ESP32C5)
 # linking the component alias does. Only LEDC is needed so far; i2c/spi/adc are
 # not driven on this target yet and adding their aliases would pull in hardware
 # support code that nothing here uses.
-target_link_libraries(${COMPONENT_LIB} PRIVATE idf::esp_hal_ledc idf::esp_hal_i2c idf::esp_hal_ana_conv idf::esp_hal_gpspi idf::esp_hal_twai idf::esp_hal_rmt idf::esp_hal_pcnt idf::esp_hal_mcpwm idf::esp_psram idf::esp_hal_usb idf::esp_hal_dma idf::esp_hal_parlio)
+target_link_libraries(${COMPONENT_LIB} PRIVATE idf::esp_hal_ledc idf::esp_hal_i2c idf::esp_hal_ana_conv idf::esp_hal_gpspi idf::esp_hal_twai idf::esp_hal_rmt idf::esp_hal_pcnt idf::esp_hal_mcpwm idf::esp_psram idf::esp_hal_usb idf::esp_hal_dma idf::esp_hal_parlio
+                    # The ADC calibration component. `adc.c` calls
+                    # adc_cali_create_scheme_curve_fitting() and
+                    # adc_cali_raw_to_voltage(), and this alias is what puts
+                    # esp_adc/include/esp_adc on the compile line - the same
+                    # measured rule as the HAL aliases above, where PRIV_REQUIRES
+                    # alone left the -I list unchanged.
+                    idf::esp_adc
+                    # The eFuse ADC calibration table. Only for reading back which
+                    # calibration version this part carries, so `c5adc` can say
+                    # whether its numbers came from eFuse or from run-time
+                    # self-calibration.
+                    idf::efuse)
 endif()
 
 if(rtt_xtensa)

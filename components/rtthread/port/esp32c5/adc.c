@@ -64,7 +64,16 @@
 #include "esp_rom_sys.h"
 #include "esp_private/esp_clk.h"
 #include "esp_private/sar_periph_ctrl.h"
+#include "esp_private/adc_share_hw_ctrl.h"
 #include "esp_attr.h"
+
+/* The ADC calibration component is already compiled into every image that has
+ * the C5 ADC enabled, but nothing referenced it, so --gc-sections dropped it and
+ * `get_vref()` returned 0. These two headers are the whole dependency. */
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_efuse_rtc_calib.h"
+
 
 #if defined(SOC_ADC_SUPPORTED)
 
@@ -215,6 +224,19 @@ static rt_err_t c5_adc_convert(struct rt_adc_device *device, rt_int8_t channel,
     adc_oneshot_ll_set_channel(ADC_UNIT_1, (adc_channel_t)channel);
     adc->channel = channel;
 
+    /* Apply the hardware OFFSET calibration code before every conversion.
+     *
+     * This is what IDF's adc_oneshot_read() does (adc_oneshot.c:237-238):
+     * `adc_hal_calibration_init()` then `adc_set_hw_calibration_code()`, per read.
+     * The port had neither, so the raw codes carried the SAR's offset error and
+     * the curve fitting above was correcting a number that had not been
+     * corrected downstream of it - measured as readings drifting between runs
+     * while the calibration was unchanged.
+     *
+     * Both are cheap: one register write each. */
+    adc_hal_calibration_init(ADC_UNIT_1);
+    adc_set_hw_calibration_code(ADC_UNIT_1, ADC_ATTEN_DB_12);
+
     /* A stale done bit from a previous conversion makes the poll below return
      * immediately and read the old result. */
     adc_oneshot_ll_clear_event(ADC_LL_EVENT_ADC1_ONESHOT_DONE);
@@ -277,24 +299,62 @@ static rt_uint8_t c5_adc_resolution(struct rt_adc_device *device)
     return SOC_ADC_RTC_MAX_BITWIDTH;
 }
 
+/* Calibrated full-scale millivolts, computed once at init.
+ *
+ * This is what `get_vref()` can honestly return: the RT-Thread framework models
+ * a conversion as `value * vref / (2^bits - 1)`, a straight line, while this chip
+ * is calibrated by a curve fit with per-channel compensation. A vref derived from
+ * the calibration at FULL SCALE makes that line exact at the top of the range and
+ * close in between; it is an approximation and is documented as one. The exact
+ * per-channel value is `c5adcv`, which calls adc_cali_raw_to_voltage().
+ *
+ * Measured before this existed: get_vref() returned 0, so rt_adc_voltage()
+ * always returned 0 mV - correct in the sense of "cannot compute", useless in
+ * practice. */
+static rt_int16_t s_adc_vref_mv;
+
 static rt_int16_t c5_adc_vref(struct rt_adc_device *device)
 {
     RT_UNUSED(device);
 
-    /* 0, not -1, and the difference matters.
-     *
-     * The framework's voltage helper (components/drivers/adc/adc.c) reads
-     * `vref = dev->ops->get_vref(dev)` and treats 0 as "cannot compute",
-     * returning a clean 0 mV. A -1 slips past that check and is multiplied into
-     * the result, which `adc voltage` then prints with the sign inside the
-     * digits - measured on the S31 as "-32.-768V".
-     *
-     * The real reason it is 0 is that this port has no calibration. The C5 does
-     * have SOC_ADC_CALIBRATION_V1_SUPPORTED, but the coefficients come from the
-     * ADC calibration component, which is not part of this port and whose
-     * numbers were never measured here. Inventing a reference voltage would make
-     * every downstream millivolt calculation inherit the lie. */
-    return 0;
+    return s_adc_vref_mv;
+}
+
+/* Raw code -> millivolts, through the real curve-fitting calibration. */
+rt_err_t rt_hw_adc_raw_to_mv(rt_int8_t channel, rt_uint32_t raw, rt_int32_t *mv)
+{
+    adc_cali_handle_t h;
+    adc_cali_curve_fitting_config_t cfg;
+    esp_err_t err;
+    int v = 0;
+
+    if (mv == RT_NULL || channel < 0 || channel >= SOC_ADC_MAX_CHANNEL_NUM)
+    {
+        return -RT_EINVAL;
+    }
+
+    rt_memset(&cfg, 0, sizeof(cfg));
+    cfg.unit_id  = ADC_UNIT_1;
+    cfg.chan     = (adc_channel_t)channel;
+    cfg.atten    = ADC_ATTEN_DB_12;
+    cfg.bitwidth = ADC_BITWIDTH_12;
+
+    err = adc_cali_create_scheme_curve_fitting(&cfg, &h);
+    if (err != ESP_OK)
+    {
+        return -RT_ERROR;
+    }
+
+    err = adc_cali_raw_to_voltage(h, (int)raw, &v);
+    adc_cali_delete_scheme_curve_fitting(h);
+
+    if (err != ESP_OK)
+    {
+        return -RT_ERROR;
+    }
+
+    *mv = (rt_int32_t)v;
+    return RT_EOK;
 }
 
 static const struct rt_adc_ops c5_adc_ops =
@@ -310,6 +370,21 @@ rt_err_t rt_hw_adc_init(void)
     rt_err_t rc;
 
     c5_adc_controller_init();
+
+    /* Compute the calibrated full-scale millivolts ONCE, by pushing the top raw
+     * code through the real curve fitting. If the calibration component has no
+     * usable eFuse data it returns an error here and vref stays 0, which the
+     * framework treats as "cannot compute" - the same honest answer as before,
+     * but now only when it is actually true. */
+    {
+        rt_int32_t mv = 0;
+
+        if (rt_hw_adc_raw_to_mv(0, (1u << SOC_ADC_RTC_MAX_BITWIDTH) - 1u, &mv) == RT_EOK &&
+            mv > 0 && mv < 5000)
+        {
+            s_adc_vref_mv = (rt_int16_t)mv;
+        }
+    }
 
     s_adc[0].channel = -1;
     s_adc[0].powered = RT_FALSE;
@@ -352,8 +427,41 @@ int c5_adc_selftest(void)
         return -1;
     }
 
-    rt_kprintf("c5adc   : unit 1, %d channel(s), %d-bit, atten 12 dB, no calib\n",
-               SOC_ADC_MAX_CHANNEL_NUM, SOC_ADC_RTC_MAX_BITWIDTH);
+    /* Which calibration is this, actually?
+     *
+     * `esp_efuse_rtc_calib_get_ver()` returning 0 means there is no eFuse
+     * calibration data and the component fell back to self-calibration at boot.
+     * Both are real measurements, but they are not the same thing, and the
+     * difference decides whether the number is worth trusting across parts. */
+    {
+        int ver = esp_efuse_rtc_calib_get_ver();
+        uint32_t init_code = esp_efuse_rtc_calib_get_init_code(ver, 0, ADC_ATTEN_DB_12);
+        uint32_t cal_digi = 0, cal_mv = 0;
+        esp_err_t e = esp_efuse_rtc_calib_get_cal_voltage(ver, 0, ADC_ATTEN_DB_12,
+                                                          &cal_digi, &cal_mv);
+
+        rt_kprintf("c5adc   : eFuse calib version=%d, init_code=0x%04x, "
+                   "cal point=%u code -> %u mV (%s)\n",
+                   ver, (unsigned)init_code, (unsigned)cal_digi, (unsigned)cal_mv,
+                   (e == ESP_OK) ? "ok" : "no data");
+
+        if (ver == 0)
+        {
+            rt_kprintf("c5adc   : NOTE - no eFuse calibration on this part; the "
+                       "figures below come from run-time self-calibration\n");
+        }
+    }
+
+    rt_kprintf("c5adc   : unit 1, %d channel(s), %d-bit, atten 12 dB, calibrated "
+               "full scale %d mV\n",
+               SOC_ADC_MAX_CHANNEL_NUM, SOC_ADC_RTC_MAX_BITWIDTH,
+               (int)s_adc_vref_mv);
+
+    if (s_adc_vref_mv == 0)
+    {
+        rt_kprintf("c5adc   : no usable calibration data in eFuse - voltage "
+                   "conversion will report 0 mV rather than a guess\n");
+    }
 
     for (ch = 0; ch < SOC_ADC_MAX_CHANNEL_NUM; ch++)
     {
@@ -409,10 +517,22 @@ int c5_adc_selftest(void)
                 note = "  (LP_UART pad)";
             }
 
-            rt_kprintf("c5adc   : ch%d (GPIO%d) raw=%u then %u, max=%u%s\n",
-                       ch, (int)c5_adc_pin((rt_int8_t)ch),
-                       (unsigned)v1, (unsigned)v2,
-                       (unsigned)((1u << SOC_ADC_RTC_MAX_BITWIDTH) - 1u), note);
+            {
+                rt_int32_t mv = -1;
+                const char *mvs = "n/a";
+
+                if (rt_hw_adc_raw_to_mv((rt_int8_t)ch, v1, &mv) == RT_EOK)
+                {
+                    mvs = "calibrated";
+                }
+
+                rt_kprintf("c5adc   : ch%d (GPIO%d) raw=%u then %u, max=%u, "
+                           "%d mV (%s)%s\n",
+                           ch, (int)c5_adc_pin((rt_int8_t)ch),
+                           (unsigned)v1, (unsigned)v2,
+                           (unsigned)((1u << SOC_ADC_RTC_MAX_BITWIDTH) - 1u),
+                           (int)mv, mvs, note);
+            }
         }
 
         rt_adc_disable(dev, ch);
