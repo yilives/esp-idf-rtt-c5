@@ -58,6 +58,7 @@ measurement rather than "OK".
 | PARLIO | `c5parlio` | GDMA feeds it, unit consumes every bit, PCNT sees the clock |
 | PSRAM | `c5psram test 7000` | 7 MB written and read back byte-exact |
 | `rt_malloc()` | `c5heap` | small blocks stay in SRAM, 4 MB lands in PSRAM, contents verified |
+| DMA → PSRAM | `c5dma` | byte-exact both directions; **fails without cache flush/invalidate** |
 | LP core | `c5ulp` | LP program runs, shares variables, checksum verified |
 | Deep sleep | `c5sleep 3` | timer wake works; **PSRAM does not survive it** |
 | USB Serial/JTAG | `c5usj` | device side only; no host, so no enumeration |
@@ -91,7 +92,7 @@ useful to the next person.
 | **PARLIO RX** | TX only |
 | **Analog layer** | no transceiver for CAN, no scope for MCPWM dead time, no host for USB |
 | **ADC accuracy** | millivolts are computed, but accuracy against a reference is not measured |
-| **PSRAM under DMA** | the SPI DMA path to PSRAM is not exercised; `c5gdma` uses internal RAM |
+| **Streaming into PSRAM** | a transfer the CPU starts works (`c5dma`); a peripheral streaming in while the CPU reads behind it is not exercised |
 
 ---
 
@@ -278,8 +279,34 @@ are wrong: small-mem over PSRAM pays the SPI-cache penalty on every access;
 memheap over 65 KB spends the tightest resource on headers.
 
 `c5heap` asserts both directions and checks contents with a position-dependent
-pattern. **Not proven:** DMA to PSRAM (needs `esp_cache_msync()` around every
-transfer, and nothing here does that yet).
+pattern.
+
+### DMA to PSRAM is not free
+
+```
+c5dma   : SRAM -> SRAM                 err= 0   0/256 differ
+c5dma   : SRAM -> PSRAM                err=-1  256/256 differ
+c5dma   : PSRAM -> SRAM                err=-1  256/256 differ
+c5dma   : PSRAM -> PSRAM with cache sync: byte-exact
+```
+
+Every PSRAM direction fails without `esp_cache_msync()`, and succeeds with it.
+Two rules:
+
+* **flush** (`DIR_C2M`) before the DMA reads the CPU's source;
+* **invalidate** (`DIR_M2C`) before **and** after the DMA writes the destination —
+  before so a dirty line cannot be written back over the output, after so the
+  CPU's next read comes from memory.
+
+`rt_hw_dma_memcpy_cached()` does this around the cache-agnostic
+`rt_hw_gdma_memcpy()`. Three constants matter: `DMA_DESCRIPTOR_BUFFER_MAX_SIZE`
+is 4095 (not 4096), memheap aligns to 8 bytes while `esp_cache_msync()` needs 32,
+and a request small enough to fit the 65 KB system heap will land in SRAM — so a
+"PSRAM" test has to ask for far more than 65 KB and assert where it landed.
+
+**Not proven:** a peripheral streaming into PSRAM while the CPU reads behind it.
+That needs the lines around the read pointer invalidated as the transfer
+advances, and it cannot be exercised without a real producer.
 
 ## The pre-build guard check
 
