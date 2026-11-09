@@ -220,35 +220,67 @@ rt_err_t rt_hw_lp_i2c_init(void)
      *
      * The rest mirrors i2c_hal_master_init(): master mode, open-drain pads,
      * arbitration off (single master here), receive-ack level. */
-    /* `i2c_ll_enable_controller_clock()` DOES NOTHING FOR LP_I2C.
+    /* DO NOT touch `ctr.clk_en`.
      *
-     * Its body is:
+     * Earlier rounds of this file wrote it on the reasoning that
+     * `i2c_ll_enable_controller_clock()` is a no-op for LP_I2C (its body returns
+     * early for that instance) and that `ctr.clk_en` was therefore the missing
+     * gate. The register header says otherwise:
      *
-     *     if (hw == &LP_I2C) { // Do nothing
-     *         return;
-     *     }
-     *     PCR.i2c[0].i2c_sclk_conf.i2c_sclk_en = en;
+     * (the header comment for that bit reads, verbatim: "clk_en : R/W; bitpos:
+     * [8]; default: 0" followed by the single word "Reserved")
      *
-     * so the HP controller gets a PCR gate and the LP one gets nothing. The LP
-     * controller's clock enable is its own `ctr.clk_en` (bit 8), which reads 0 out
-     * of reset and which nothing in the LL sets. Measured: `ctr` = 0x00000208
-     * (only the two reset-1 defaults), all five commands at done=0, and
-     * `trans_start` never latching - a controller that looks configured from
-     * every other register and has no clock.
      *
-     * Setting it directly is the only path the LL offers. */
-    LP_I2C.ctr.clk_en = 1;
+     * It is a RESERVED bit. IDF never writes it, and writing a reserved bit to
+     * "make the clock work" is guessing at silicon, not programming it. If the LP
+     * I2C is silent, the cause is somewhere the LL does expose - and the honest
+     * move is to find it, not to poke at reserved bits until something changes.
+     *
+     * The LL still enables what IDF enables for this instance:
+     * `lp_i2c_ll_enable_bus_clock()` (LPPERI) above, and `i2c_hal_init()`'s
+     * `i2c_ll_enable_controller_clock()` below, which is a deliberate no-op here.
+     */
+    i2c_ll_enable_controller_clock(s_lp_i2c.hw, true);
     i2c_ll_set_mode(s_lp_i2c.hw, I2C_BUS_MODE_MASTER);
     i2c_ll_enable_pins_open_drain(s_lp_i2c.hw, true);
     i2c_ll_enable_arbitration(s_lp_i2c.hw, false);
     i2c_ll_master_rx_full_ack_level(s_lp_i2c.hw, false);
 
+    /* FIFO thresholds left at their RESET VALUES (rxfifo_wm=6, txfifo_wm=2).
+     *
+     * IDF's driver never sets them for LP I2C - measured `fifo_conf=0x4046` both
+     * before and after its transfer, which is exactly the reset value. This port
+     * had been writing 4 and 8, giving `0x4088`. The watermark is not obviously
+     * a reason for the FSM to refuse to start, but it is a difference, and
+     * removing differences is cheaper than reasoning about which one matters. */
     i2c_ll_enable_fifo_mode(s_lp_i2c.hw, true);
     i2c_ll_set_data_mode(s_lp_i2c.hw, I2C_DATA_MODE_MSB_FIRST, I2C_DATA_MODE_MSB_FIRST);
-    i2c_ll_set_txfifo_empty_thr(s_lp_i2c.hw, 4);
-    i2c_ll_set_rxfifo_full_thr(s_lp_i2c.hw, 8);
 
     i2c_ll_set_source_clk(s_lp_i2c.hw, I2C_CLK_SRC_XTAL);
+
+    /* Two calls IDF makes that this driver did not (i2c_master.c:133,136).
+     *
+     * `i2c_ll_disable_intr_mask()` matters more than it looks: the interrupt
+     * mask register gates events into `int_st`, and IDF clears it before use.
+     * This driver polls `int_raw`, so the mask should not matter - but a stale
+     * mask from the HP driver's own init (this image runs `i2c0` too) is
+     * exactly the kind of cross-driver state that produces "the FSM never ran"
+     * with an empty status.
+     *
+     * `i2c_ll_master_set_filter()` with 0 is "no glitch filter", which is the
+     * reset value; setting it explicitly removes the question. */
+    i2c_ll_disable_intr_mask(s_lp_i2c.hw, 0xFFFFFFFFu);
+    i2c_ll_clear_intr_mask(s_lp_i2c.hw, 0xFFFFFFFFu);
+    i2c_ll_master_set_filter(s_lp_i2c.hw, 0);
+
+    /* Timing is programmed per transfer, not here.
+     *
+     * Measured on IDF's own driver: before `i2c_master_transmit()` returns, the
+     * bus timing registers read ZERO (`scl_low=0 scl_high=0`), and after it they
+     * read 119/62. So IDF applies the timing inside the transfer, on the same
+     * path that arms the commands. Doing it once at init - which is what the HP
+     * driver does and what this port copied - is a real difference, and worth
+     * removing before reasoning about the FSM. */
     c5_lp_i2c_apply_freq(C5_LP_I2C_FREQ);
     i2c_ll_update(s_lp_i2c.hw);
 
@@ -290,21 +322,48 @@ static rt_err_t c5_lp_i2c_xfer_msg(struct rt_i2c_msg *msg)
      * So they are not the cause, and removing them costs nothing. */
     i2c_ll_clear_intr_mask(hw, 0xFFFFFFFFu);
 
+    /* Same place IDF applies it: immediately before arming the transfer. */
+    c5_lp_i2c_apply_freq(s_lp_i2c.freq ? s_lp_i2c.freq : C5_LP_I2C_FREQ);
+
     cmd.val = 0;
     cmd.op_code = I2C_LL_CMD_RESTART;
     i2c_ll_master_write_cmd_reg(hw, cmd, (int)idx++);
 
-    cmd.val = 0;
-    cmd.op_code = I2C_LL_CMD_WRITE;
-    cmd.byte_num = 1;
-    cmd.ack_en = 1;
-    cmd.ack_exp = 0;
-    cmd.ack_val = 0;
-    i2c_ll_master_write_cmd_reg(hw, cmd, (int)idx++);
-    i2c_ll_write_txfifo(hw, &addr, 1);
-
+    /* THE ADDRESS AND THE FIRST DATA BYTE GO IN ONE WRITE COMMAND.
+     *
+     * This is the difference that made the peripheral look dead. The first
+     * version emitted RESTART, WRITE(1 byte = address), WRITE(n bytes = data),
+     * STOP, END - five commands, which is how the HP controller behaves and how
+     * the S31 driver is written. On this LP controller the FSM never starts:
+     * every command sits with `command_done` clear and `int_raw` empty.
+     *
+     * IDF's own driver (`i2c_master.c:194`) does:
+     *
+     *     hw_cmd.byte_num = data_fill + *address_fill;
+     *     i2c_ll_write_txfifo(hal->dev, write_pr, data_fill);
+     *     i2c_ll_master_write_cmd_reg(hal->dev, hw_cmd, i2c_master->cmd_idx);
+     *
+     * one WRITE with the address folded in, and it gets a NACK back from a
+     * reserved address - which means the bus was driven. Measured side by side:
+     *
+     *     IDF : cmd[0]=0x80003000 cmd[1]=0x00000902 cmd[2]=0x00001000   (done=1)
+     *     port: cmd[0]=0x00003000 cmd[1]=0x00000901 cmd[2]=0x00000901   (done=0)
+     *
+     * 0x902 is byte_num=2, 0x901 is byte_num=1. That is the whole difference. */
     if (msg->flags & RT_I2C_RD)
     {
+        /* Address phase on its own, then a READ: the controller needs the
+         * repeated start between them, and the address cannot be folded into a
+         * READ the way it is folded into a WRITE. */
+        cmd.val = 0;
+        cmd.op_code = I2C_LL_CMD_WRITE;
+        cmd.byte_num = 1;
+        cmd.ack_en = 1;
+        cmd.ack_exp = 0;
+        cmd.ack_val = 0;
+        i2c_ll_write_txfifo(hw, &addr, 1);
+        i2c_ll_master_write_cmd_reg(hw, cmd, (int)idx++);
+
         cmd.val = 0;
         cmd.op_code = I2C_LL_CMD_READ;
         cmd.byte_num = (rt_uint8_t)msg->len;
@@ -313,21 +372,45 @@ static rt_err_t c5_lp_i2c_xfer_msg(struct rt_i2c_msg *msg)
     }
     else if (msg->len > 0u)
     {
+        /* Address + every data byte in ONE command, exactly as IDF does it. */
         cmd.val = 0;
         cmd.op_code = I2C_LL_CMD_WRITE;
-        cmd.byte_num = (rt_uint8_t)msg->len;
+        cmd.byte_num = (rt_uint8_t)(msg->len + 1u);
         cmd.ack_en = 1;
         cmd.ack_exp = 0;
-        i2c_ll_master_write_cmd_reg(hw, cmd, (int)idx++);
+        cmd.ack_val = 0;
+        /* FIFO FIRST, then the command - IDF's order (i2c_master.c:198-199).
+         * Writing the command first tells the FSM to start on an empty FIFO. */
+        i2c_ll_write_txfifo(hw, &addr, 1);
         i2c_ll_write_txfifo(hw, msg->buf, (uint8_t)msg->len);
+        i2c_ll_master_write_cmd_reg(hw, cmd, (int)idx++);
+    }
+    else
+    {
+        /* Probe only: the address byte alone, still one WRITE. */
+        cmd.val = 0;
+        cmd.op_code = I2C_LL_CMD_WRITE;
+        cmd.byte_num = 1;
+        cmd.ack_en = 1;
+        cmd.ack_exp = 0;
+        cmd.ack_val = 0;
+        i2c_ll_write_txfifo(hw, &addr, 1);
+        i2c_ll_master_write_cmd_reg(hw, cmd, (int)idx++);
     }
 
+    /* STOP, and NOT END.
+     *
+     * IDF's driver emits RESTART, WRITE, STOP - three commands, no END - because
+     * this part has SOC_I2C_STOP_INDEPENDENT: the STOP carries its own end
+     * semantics and a following END is a fifth command the FSM is not expecting.
+     * Measured side by side against IDF's own driver on this board:
+     *
+     *     IDF : cmd[0]=0x80003000  cmd[1]=0x00000902  cmd[2]=0x00001000
+     *     port: cmd[0]=0x00003000  cmd[1]=0x00000902  cmd[2]=0x00001000  cmd[3]=0x00002000
+     *
+     * The port had one command too many. */
     cmd.val = 0;
     cmd.op_code = I2C_LL_CMD_STOP;
-    i2c_ll_master_write_cmd_reg(hw, cmd, (int)idx++);
-
-    cmd.val = 0;
-    cmd.op_code = I2C_LL_CMD_END;
     i2c_ll_master_write_cmd_reg(hw, cmd, (int)idx++);
 
     rt_kprintf("c5lpi2c: pre-start fifo_conf=0x%08x ctr=0x%08x cmd0=0x%08x\n",

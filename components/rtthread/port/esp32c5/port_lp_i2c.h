@@ -25,8 +25,13 @@ rt_err_t rt_hw_lp_i2c_register(void);
  * a reserved address. */
 int c5_lp_i2c_selftest(void);
 
+/* The same experiment through ESP-IDF's own LP I2C driver. Exists to tell
+ * "this port's driver is wrong" from "the peripheral is silent either way". */
+int c5_lp_i2c_idf_selftest(void);
+
 #ifdef __cplusplus
 }
 #endif
 
 #endif /* PORT_LP_I2C_H */
+

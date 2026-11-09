@@ -590,7 +590,9 @@ elseif(CONFIG_IDF_TARGET_ESP32C5)
         # Cache discipline for DMA touching PSRAM.
         "port/esp32c5/cache.c"
         # Kernel soak: does anything leak under sustained churn.
-        "port/esp32c5/soak.c")
+        "port/esp32c5/soak.c"
+        # The LP I2C experiment through IDF's own driver. Temporary.
+        "port/esp32c5/lp_i2c_idf.c")
 
     # The FreeRTOS-API compatibility layer, target independent - the same files
     # the S31 uses. Without this block a C5 build with
@@ -827,6 +829,7 @@ if(CONFIG_IDF_TARGET_ESP32C5)
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_heap_selftest")
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_dma_psram_selftest")
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_soak_selftest")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_lp_i2c_idf_selftest")
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_pin_init" "-u c5_probe_pads")
     # lp_sleep.c has no init function of its own - it is driven from the
     # shell and from the boot banner - so the anchor is its command.
@@ -983,7 +986,7 @@ target_link_libraries(${COMPONENT_LIB} PRIVATE idf::esp_hal_ledc idf::esp_hal_i2
                     # esp_adc/include/esp_adc on the compile line - the same
                     # measured rule as the HAL aliases above, where PRIV_REQUIRES
                     # alone left the -I list unchanged.
-                    idf::esp_adc idf::esp_mm idf::esp_timer
+                    idf::esp_adc idf::esp_mm idf::esp_timer idf::esp_driver_i2c
                     # The eFuse ADC calibration table. Only for reading back which
                     # calibration version this part carries, so `c5adc` can say
                     # whether its numbers came from eFuse or from run-time
