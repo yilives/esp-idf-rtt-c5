@@ -408,15 +408,40 @@ int c5_spi_selftest(rt_uint32_t port, rt_bool_t inside)
      * has to be attached to the bus first: that call fills in device->bus, the CS
      * pin and the lock. */
     {
+        /* IDEMPOTENT: the attach registers a device by name, and the static
+         * struct survives between runs, so a second `c5spiloop` in the same boot
+         * tries to register the same name again and fails.
+         *
+         * Measured, and it is the whole reason this test looked broken when run
+         * twice:
+         *
+         *     c5spiloop -> PASS, loopback identical
+         *     c5spiloop -> attach to spi0 failed
+         *
+         * `rt_spidev_device_init()` ends in `rt_device_register(device, name, ...)`
+         * and the object manager refuses a duplicate name, so the second attach
+         * returns an error even though the device is already there and correct.
+         * Reusing it is the right answer: the object is the same one.
+         *
+         * A test that can only pass once is not testing the driver, it is testing
+         * the first call. */
         static struct rt_spi_device loop_dev;
+        rt_device_t existing = rt_device_find("spiloop");
 
-        if (rt_spi_bus_attach_device(&loop_dev, "spiloop", bus_name, RT_NULL) != RT_EOK)
+        if (existing != RT_NULL)
         {
-            rt_kprintf("c5spiloop: attach to %s failed\n", bus_name);
+            dev = (struct rt_spi_device *)existing;
+        }
+        else if (rt_spi_bus_attach_device(&loop_dev, "spiloop", bus_name, RT_NULL) == RT_EOK)
+        {
+            dev = &loop_dev;
+        }
+        else
+        {
+            rt_kprintf("c5spiloop: attach to %s failed and \"spiloop\" is not "
+                       "registered either\n", bus_name);
             return -1;
         }
-
-        dev = &loop_dev;
     }
 
     rt_memset(&cfg, 0, sizeof(cfg));
