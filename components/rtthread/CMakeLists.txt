@@ -150,11 +150,6 @@ set(kernel_srcs
     "${RTTHREAD_ROOT}/src/irq.c"
     "${RTTHREAD_ROOT}/src/kservice.c"
     "${RTTHREAD_ROOT}/src/mem.c"
-    # memheap.c: the second allocator (`psram`), and the one the system heap
-    # itself uses once RT_USING_MEMHEAP_AS_HEAP is on. Upstream compiles it
-    # from SConscript only when RT_USING_MEMHEAP is set; this list is
-    # unconditional, so the guard inside the file does the work.
-    "${RTTHREAD_ROOT}/src/memheap.c"
     # mempool.c defines rt_mp_create()/rt_mp_alloc()/rt_mp_free(). It is a
     # separate translation unit from mem.c and is only compiled by upstream's
     # SConscript when RT_USING_MEMPOOL is on, which is the Kconfig default - so
@@ -530,11 +525,10 @@ elseif(CONFIG_IDF_TARGET_ESP32C5)
     # port/esp32c5 differ only in the SoC name and in the two trap-path tables
     # cpuport.c has to define for a single-core build.
     #
-    # gpio.c, pwm.c, i2c.c, spi.c and adc.c were absent in the first version,
-    # because they were written against the S31's LL headers and pin maps. They
-    # have since been brought up here, along with TWAI, RMT, PCNT, MCPWM, the
-    # temperature sensor, PSRAM, USB Serial/JTAG, AHB GDMA and PARLIO; `list
-    # device` now shows eight devices. The list below is the current one.
+    # gpio.c, pwm.c, i2c.c, spi.c and adc.c are deliberately absent: they are
+    # written against the S31's LL headers and pin maps and have not been brought
+    # up here. `list device` therefore shows uart0 and pin only, which is the
+    # honest state of this port.
     set(target_srcs
         "port/esp32c5/cpuport.c"
         "port/esp32c5/interrupt.c"
@@ -584,17 +578,7 @@ elseif(CONFIG_IDF_TARGET_ESP32C5)
         # Deep sleep: what survives the HP core being powered down.
         "port/esp32c5/lp_sleep.c"
         # LP I2C: the low-power domain I2C controller as `lp_i2c0`.
-        "port/esp32c5/lp_i2c.c"
-        # Heap routing: proves rt_malloc() reaches PSRAM for large blocks.
-        "port/esp32c5/heap.c"
-        # Cache discipline for DMA touching PSRAM.
-        "port/esp32c5/cache.c"
-        # Kernel soak: does anything leak under sustained churn.
-        "port/esp32c5/soak.c"
-        # The LP I2C experiment through IDF's own driver. Temporary.
-        "port/esp32c5/lp_i2c_idf.c"
-        # The LP UART, written after the LP I2C pad lesson.
-        "port/esp32c5/lp_uart.c")
+        "port/esp32c5/lp_i2c.c")
 
     # The FreeRTOS-API compatibility layer, target independent - the same files
     # the S31 uses. Without this block a C5 build with
@@ -827,12 +811,6 @@ if(CONFIG_IDF_TARGET_ESP32C5)
     # same shape as the seven above. This one anchor also brings in `c5can`,
     # which lives in the same archive member.
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_can_c5_init")
-    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_psram_heap_auto_init")
-    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_heap_selftest")
-    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_dma_psram_selftest")
-    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_soak_selftest")
-    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_lp_i2c_idf_selftest")
-    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_lp_uart_selftest")
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_pin_init" "-u c5_probe_pads")
     # lp_sleep.c has no init function of its own - it is driven from the
     # shell and from the boot banner - so the anchor is its command.
@@ -982,19 +960,7 @@ if(CONFIG_IDF_TARGET_ESP32C5)
 # linking the component alias does. Only LEDC is needed so far; i2c/spi/adc are
 # not driven on this target yet and adding their aliases would pull in hardware
 # support code that nothing here uses.
-target_link_libraries(${COMPONENT_LIB} PRIVATE idf::esp_hal_ledc idf::esp_hal_i2c idf::esp_hal_ana_conv idf::esp_hal_gpspi idf::esp_hal_twai idf::esp_hal_rmt idf::esp_hal_pcnt idf::esp_hal_mcpwm idf::esp_psram idf::esp_hal_usb idf::esp_hal_dma idf::esp_hal_parlio
-                    # The ADC calibration component. `adc.c` calls
-                    # adc_cali_create_scheme_curve_fitting() and
-                    # adc_cali_raw_to_voltage(), and this alias is what puts
-                    # esp_adc/include/esp_adc on the compile line - the same
-                    # measured rule as the HAL aliases above, where PRIV_REQUIRES
-                    # alone left the -I list unchanged.
-                    idf::esp_adc idf::esp_mm idf::esp_timer idf::esp_driver_i2c idf::esp_driver_gpio
-                    # The eFuse ADC calibration table. Only for reading back which
-                    # calibration version this part carries, so `c5adc` can say
-                    # whether its numbers came from eFuse or from run-time
-                    # self-calibration.
-                    idf::efuse)
+target_link_libraries(${COMPONENT_LIB} PRIVATE idf::esp_hal_ledc idf::esp_hal_i2c idf::esp_hal_ana_conv idf::esp_hal_gpspi idf::esp_hal_twai idf::esp_hal_rmt idf::esp_hal_pcnt idf::esp_hal_mcpwm idf::esp_psram idf::esp_hal_usb idf::esp_hal_dma idf::esp_hal_parlio)
 endif()
 
 if(rtt_xtensa)
