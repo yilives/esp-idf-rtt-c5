@@ -150,6 +150,7 @@ set(kernel_srcs
     "${RTTHREAD_ROOT}/src/irq.c"
     "${RTTHREAD_ROOT}/src/kservice.c"
     "${RTTHREAD_ROOT}/src/mem.c"
+    "${RTTHREAD_ROOT}/src/memheap.c"
     # mempool.c defines rt_mp_create()/rt_mp_alloc()/rt_mp_free(). It is a
     # separate translation unit from mem.c and is only compiled by upstream's
     # SConscript when RT_USING_MEMPOOL is on, which is the Kconfig default - so
@@ -578,7 +579,15 @@ elseif(CONFIG_IDF_TARGET_ESP32C5)
         # Deep sleep: what survives the HP core being powered down.
         "port/esp32c5/lp_sleep.c"
         # LP I2C: the low-power domain I2C controller as `lp_i2c0`.
-        "port/esp32c5/lp_i2c.c")
+        "port/esp32c5/lp_i2c.c"
+        # ADDED AFTER THE FIRST WORKING IMAGE. An external change has
+        # rolled this list back more than once; the symptom is
+        # `undefined reference` for a command that had been working.
+        "port/esp32c5/lp_i2c_idf.c"
+        "port/esp32c5/lp_uart.c"
+        "port/esp32c5/heap.c"
+        "port/esp32c5/cache.c"
+        "port/esp32c5/soak.c")
 
     # The FreeRTOS-API compatibility layer, target independent - the same files
     # the S31 uses. Without this block a C5 build with
@@ -816,6 +825,12 @@ if(CONFIG_IDF_TARGET_ESP32C5)
     # shell and from the boot banner - so the anchor is its command.
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_lp_sleep_selftest")
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_lp_i2c_selftest")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_psram_heap_auto_init")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_heap_selftest")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_dma_psram_selftest")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_soak_selftest")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_lp_i2c_idf_selftest")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_lp_uart_selftest")
 endif()
 
 if(rtt_xtensa)
@@ -961,6 +976,10 @@ if(CONFIG_IDF_TARGET_ESP32C5)
 # not driven on this target yet and adding their aliases would pull in hardware
 # support code that nothing here uses.
 target_link_libraries(${COMPONENT_LIB} PRIVATE idf::esp_hal_ledc idf::esp_hal_i2c idf::esp_hal_ana_conv idf::esp_hal_gpspi idf::esp_hal_twai idf::esp_hal_rmt idf::esp_hal_pcnt idf::esp_hal_mcpwm idf::esp_psram idf::esp_hal_usb idf::esp_hal_dma idf::esp_hal_parlio)
+
+target_link_libraries(${COMPONENT_LIB} PRIVATE
+    idf::esp_adc idf::efuse idf::esp_mm idf::esp_timer
+    idf::esp_driver_i2c idf::esp_driver_gpio)
 endif()
 
 if(rtt_xtensa)
