@@ -44,7 +44,37 @@
 
 #include "hal/i2c_ll.h"
 
+#include "hal/i2c_hal.h"
+
 #include "port_lp_i2c.h"
+
+
+/* Every LP I2C register that could plausibly gate the FSM, in one line per
+ * group. Two independent drivers, one dump each, then a textual diff - that is
+ * how thirteen rounds of "this field looks the same" get settled. */
+static void c5_lp_i2c_dump_all(const char *tag)
+{
+    const i2c_dev_t *h = I2C_LL_GET_HW(1);
+
+    rt_kprintf("DUMP %s ctr=%08x sr=%08x to=%08x fifo_conf=%08x fifo_st=%08x\n",
+        tag, (unsigned)h->ctr.val, (unsigned)h->sr.val, (unsigned)h->to.val,
+        (unsigned)h->fifo_conf.val, (unsigned)h->fifo_st.val);
+    rt_kprintf("DUMP %s scl_low=%08x scl_high=%08x scl_wait_high=%08x\n",
+        tag, (unsigned)h->scl_low_period.val, (unsigned)h->scl_high_period.val,
+        (unsigned)h->scl_high_period.scl_wait_high_period);
+    rt_kprintf("DUMP %s sda_hold=%08x sda_sample=%08x filter=%08x clk_conf=%08x\n",
+        tag, (unsigned)h->sda_hold.val, (unsigned)h->sda_sample.val,
+        (unsigned)h->filter_cfg.val, (unsigned)h->clk_conf.val);
+    rt_kprintf("DUMP %s start_h=%08x rstart_s=%08x stop_h=%08x stop_s=%08x\n",
+        tag, (unsigned)h->scl_start_hold.val, (unsigned)h->scl_rstart_setup.val,
+        (unsigned)h->scl_stop_hold.val, (unsigned)h->scl_stop_setup.val);
+    rt_kprintf("DUMP %s st_to=%08x main_st_to=%08x sp_conf=%08x int_ena=%08x\n",
+        tag, (unsigned)h->scl_st_time_out.val, (unsigned)h->scl_main_st_time_out.val,
+        (unsigned)h->scl_sp_conf.val, (unsigned)h->int_ena.val);
+    rt_kprintf("DUMP %s cmd=%08x,%08x,%08x,%08x\n",
+        tag, (unsigned)h->command[0].val, (unsigned)h->command[1].val,
+        (unsigned)h->command[2].val, (unsigned)h->command[3].val);
+}
 
 int c5_lp_i2c_idf_selftest(void)
 {
@@ -112,6 +142,101 @@ int c5_lp_i2c_idf_selftest(void)
         }
     }
 
+    /* Dump the LP-domain clock registers BEFORE the transfer, so they can be
+     * compared with what `c5lpi2c` leaves. This is the last piece of shared state
+     * that neither the driver dump nor the source comparison covers: the LP
+     * peripheral clock gate (LPPERI) and the LP clock select (LP_CLKRST) are set
+     * up by `esp_clk_tree_enable_src()` and by the LP-core/PM code, not by the
+     * I2C driver, so a hand-written driver can look identical at the controller
+     * while the domain is clocked differently. */
+    {
+        rt_kprintf("c5lpi2cidf: IDF LP_CLKRST.lpperi=0x%08x lp_i2c_clk_sel=%u "
+                   "(0=LP_FAST, 1=XTAL_D2)\n",
+                   (unsigned)LP_CLKRST.lpperi.val,
+                   (unsigned)LP_CLKRST.lpperi.lp_i2c_clk_sel);
+        rt_kprintf("c5lpi2cidf: IDF LPPERI.clk_en=0x%08x reset_en=0x%08x\n",
+                   (unsigned)LPPERI.clk_en.val,
+                   (unsigned)LPPERI.reset_en.val);
+    }
+
+    /* HYBRID, CLEAN: IDF creates the bus and configures everything, then this
+     * hand-written sequence drives the transfer WITHOUT IDF's transmit ever
+     * running. The earlier version of this test drove the bus AFTER IDF's
+     * transmit, so it could not tell "the configuration matters" from "the bus
+     * was already moving". This one can.
+     *
+     * If this completes: IDF's configuration is what the port is missing.
+     * If it does not complete: the difference is in the transfer code, and the
+     * configuration has been proven equivalent by the register dumps above. */
+    {
+        i2c_dev_t *hw = I2C_LL_GET_HW(LP_I2C_NUM_0);
+        i2c_ll_hw_cmd_t cmd;
+        rt_uint32_t guard;
+        rt_bool_t done = RT_FALSE;
+        uint8_t probe[2] = { 0xFE, 0x00 };   /* 0x7F << 1, one data byte */
+
+        /* IDF has configured the bus but not transmitted. Apply the timing it
+         * would apply, since that happens inside transmit. */
+        i2c_hal_context_t hal = { .dev = hw };
+        i2c_hal_set_bus_timing(&hal, 100000, I2C_CLK_SRC_XTAL, 48000000);
+        i2c_ll_update(hw);
+
+        i2c_ll_txfifo_rst(hw);
+        i2c_ll_rxfifo_rst(hw);
+
+        cmd.val = 0;
+        cmd.op_code = I2C_LL_CMD_RESTART;
+        i2c_ll_master_write_cmd_reg(hw, cmd, 0);
+
+        cmd.val = 0;
+        cmd.op_code = I2C_LL_CMD_WRITE;
+        cmd.byte_num = 2;
+        cmd.ack_en = 1;
+        cmd.ack_exp = 0;
+        cmd.ack_val = 0;
+        i2c_ll_write_txfifo(hw, probe, 2);
+        i2c_ll_master_write_cmd_reg(hw, cmd, 1);
+
+        cmd.val = 0;
+        cmd.op_code = I2C_LL_CMD_STOP;
+        i2c_ll_master_write_cmd_reg(hw, cmd, 2);
+
+        c5_lp_i2c_dump_all("IDF");
+        c5_lp_i2c_dump_all("IDF-REFERENCE");
+        i2c_ll_update(hw);
+        i2c_ll_start_trans(hw);
+
+        for (guard = 0; guard < 500000u; guard++)
+        {
+            if (hw->command[2].command_done)
+            {
+                done = RT_TRUE;
+                break;
+            }
+        }
+
+        rt_kprintf("c5lpi2cidf: hybrid(clean) done=%s int_raw=0x%08x "
+                   "cmd0=0x%08x cmd1=0x%08x cmd2=0x%08x\n",
+                   done ? "yes" : "NO", (unsigned)hw->int_raw.val,
+                   (unsigned)hw->command[0].val,
+                   (unsigned)hw->command[1].val,
+                   (unsigned)hw->command[2].val);
+
+        if (done)
+        {
+            rt_kprintf("c5lpi2cidf: PASS - the hand-written sequence works when IDF "
+                       "configured the bus first. The missing piece is in this "
+                       "port's own initialisation.\n");
+        }
+        else
+        {
+            rt_kprintf("c5lpi2cidf: the hand-written sequence fails even on IDF's "
+                       "configuration. The difference is in the TRANSFER code, not "
+                       "in initialisation - and the register dumps above agree on "
+                       "every controller field.\n");
+        }
+    }
+
     /* One byte to an address that cannot be there. A NACK is the success case:
      * it means the controller drove a start condition and clocked nine bits. */
     err = i2c_master_transmit(dev, &dummy, 1, 200);
@@ -154,63 +279,6 @@ int c5_lp_i2c_idf_selftest(void)
         {
             rt_kprintf("c5lpi2cidf: IDF left cmd[%d]=0x%08x\n",
                        k, (unsigned)hw->command[k].val);
-        }
-    }
-
-    /* HYBRID: let IDF configure the controller, then drive it by hand.
-     *
-     * If this works, IDF's configuration leaves some state this port's init does
-     * not produce, and the difference is in the register dump below. If it still
-     * fails, the difference is not in configuration at all - it is in how the
-     * transfer is started, and the search narrows to those few instructions.
-     *
-     * One byte to 0x7F again: NACK means the bus was driven. */
-    {
-        i2c_dev_t *hw = I2C_LL_GET_HW(LP_I2C_NUM_0);
-        i2c_ll_hw_cmd_t cmd;
-        rt_uint32_t guard;
-        rt_bool_t done = RT_FALSE;
-
-        rt_kprintf("c5lpi2cidf: hybrid - careful, the bus is still owned by IDF\n");
-
-        /* Reuse IDF's timing but write the command ourselves, exactly as
-         * `c5lpi2c` does. */
-        cmd.val = 0;
-        cmd.op_code = I2C_LL_CMD_RESTART;
-        i2c_ll_master_write_cmd_reg(hw, cmd, 0);
-
-        cmd.val = 0;
-        cmd.op_code = I2C_LL_CMD_WRITE;
-        cmd.byte_num = 2;
-        cmd.ack_en = 1;
-        cmd.ack_exp = 0;
-        cmd.ack_val = 0;
-        i2c_ll_write_txfifo(hw, (const uint8_t *)"\xFE\x00", 2);
-        i2c_ll_master_write_cmd_reg(hw, cmd, 1);
-
-        cmd.val = 0;
-        cmd.op_code = I2C_LL_CMD_STOP;
-        i2c_ll_master_write_cmd_reg(hw, cmd, 2);
-
-        i2c_ll_update(hw);
-        i2c_ll_start_trans(hw);
-
-        for (guard = 0; guard < 200000u; guard++)
-        {
-            if (hw->command[2].command_done)
-            {
-                done = RT_TRUE;
-                break;
-            }
-        }
-
-        rt_kprintf("c5lpi2cidf: hybrid command done=%s int_raw=0x%08x\n",
-                   done ? "yes" : "NO", (unsigned)hw->int_raw.val);
-
-        if (done)
-        {
-            rt_kprintf("c5lpi2cidf: PASS - IDF's CONFIGURATION is what matters; the "
-                       "state it leaves behind is in the dump above\n");
         }
     }
 

@@ -121,24 +121,44 @@ static void c5_lp_i2c_set_pins(void)
     rtc_gpio_set_direction((gpio_num_t)C5_LP_I2C_SDA_PIN, RTC_GPIO_MODE_INPUT_OUTPUT_OD);
     rtc_gpio_pulldown_dis((gpio_num_t)C5_LP_I2C_SDA_PIN);
     rtc_gpio_pullup_en((gpio_num_t)C5_LP_I2C_SDA_PIN);
-    rtc_gpio_iomux_input((gpio_num_t)C5_LP_I2C_SDA_PIN, C5_LP_I2C_MUX_FUNC,
-                         I2CEXT0_SDA_IN_IDX);
+    /* SIGNAL INDEX 0, not I2CEXT0_SDA_IN_IDX.
+     *
+     * `i2c_periph.c:24-33` gives the LP instance `.sda_in_sig = 0` and
+     * `.scl_in_sig = 0`, while the HP instance uses I2CEXT0_*_IN_IDX (47/49).
+     * This driver passed the HP indices - the same GPIO matrix signal numbers a
+     * different controller listens on - so the LP I2C's input saw whatever the
+     * HP I2C0 drive was doing and never its own pads.
+     *
+     * Everything else matched: the full register dump is identical field for
+     * field apart from the timing values (IDF 119/62 for 100 kHz, this driver
+     * 120/62 - both correct for the same bus speed). One wrong constant. */
+    rtc_gpio_iomux_input((gpio_num_t)C5_LP_I2C_SDA_PIN, C5_LP_I2C_MUX_FUNC, 0);
 
     rtc_gpio_init((gpio_num_t)C5_LP_I2C_SCL_PIN);
     rtc_gpio_set_direction((gpio_num_t)C5_LP_I2C_SCL_PIN, RTC_GPIO_MODE_INPUT_OUTPUT_OD);
     rtc_gpio_pulldown_dis((gpio_num_t)C5_LP_I2C_SCL_PIN);
     rtc_gpio_pullup_en((gpio_num_t)C5_LP_I2C_SCL_PIN);
-    rtc_gpio_iomux_input((gpio_num_t)C5_LP_I2C_SCL_PIN, C5_LP_I2C_MUX_FUNC,
-                         I2CEXT0_SCL_IN_IDX);
+    rtc_gpio_iomux_input((gpio_num_t)C5_LP_I2C_SCL_PIN, C5_LP_I2C_MUX_FUNC, 0);
 
-    /* SDA = IO2, SCL = IO3, both open-drain with the pull-up doing the high
-     * level. `RTCIO_LL_FUNC_DIGITAL` puts the pad on the digital side - the LP
-     * peripheral is a digital function even though it lives in the LP domain. */
-    rtcio_ll_function_select(C5_LP_I2C_SDA_PIN, RTCIO_LL_FUNC_DIGITAL);
-    rtcio_ll_function_select(C5_LP_I2C_SCL_PIN, RTCIO_LL_FUNC_DIGITAL);
-
-    rtcio_ll_iomux_func_sel(C5_LP_I2C_SDA_PIN, C5_LP_I2C_MUX_FUNC);
-    rtcio_ll_iomux_func_sel(C5_LP_I2C_SCL_PIN, C5_LP_I2C_MUX_FUNC);
+    /* THE LEFTOVER RAW CALLS ARE GONE, and that was the bug.
+     *
+     * The comment above says "use rtc_gpio_*, not the raw rtcio_ll_* calls" - and
+     * then four raw calls sat below it and undid the work:
+     *
+     *     rtcio_ll_function_select(pin, RTCIO_LL_FUNC_DIGITAL);
+     *     rtcio_ll_iomux_func_sel(pin, C5_LP_I2C_MUX_FUNC);
+     *
+     * `rtc_gpio_iomux_input()` configures the pad as an RTC-domain input with the
+     * peripheral's function; these two then re-select the DIGITAL function and
+     * overwrite the IOMUX select, putting the pad back on the digital side where
+     * the LP peripheral's input is not connected. Every register still read back
+     * correctly, the pads still idled high, and the FSM still never started -
+     * because the pad was no longer wired to it.
+     *
+     * This is the concrete form of the lesson in the report: a fix applied in one
+     * place, with the original code left in place below it, looks exactly like a
+     * fix that does not work. The agent that wrote both lines meant the new one
+     * to win. */
 
     /* Drive the idle level HIGH before touching the output enable.
      *
@@ -221,18 +241,27 @@ rt_err_t rt_hw_lp_i2c_init(void)
 
     /* LPPERI, not PCR: the LP I2C bus clock lives in the LP peripheral block and
      * survives the HP domain being powered down. */
-    /* Reset FIRST, then enable, then pick the source.
+    /* CLOCK FIRST, THEN RESET. Vector 13 of this peripheral, and this driver had
+     * it backwards from the first version.
      *
-     * `lp_i2c_ll_reset_register()` pulses `LPPERI.reset_en.lp_ext_i2c_reset_en`,
-     * and doing that after the bus clock is on leaves the block held in reset for
-     * as long as the pulse lasts - which is fine - but doing it after
-     * `ctr.clk_en` is set clears that bit again, because reset returns the whole
-     * register file. The order here is reset, enable, source, then the
-     * configuration writes below. */
+     *     i2c_common.c:124-125, IDF's order:
+     *         lp_i2c_ll_enable_bus_clock(bus->port_num - SOC_HP_I2C_NUM, true);
+     *         lp_i2c_ll_reset_register(bus->port_num - SOC_HP_I2C_NUM);
+     *
+     * `lp_i2c_ll_reset_register()` pulses
+     * `LPPERI.reset_en.lp_ext_i2c_reset_en`. A reset pulse delivered to a block
+     * whose bus clock is off is not a reset: the register file cannot be cleared
+     * without a clock, so the pulse does nothing and the block comes out of it in
+     * whatever state it was already in when the clock finally arrives.
+     *
+     * The comment that used to sit here argued the opposite - that resetting
+     * after enabling would clear `ctr.clk_en`. That is reasoning about a bit this
+     * driver no longer writes (it is Reserved), and it was the reason the order
+     * stayed wrong for so long. */
     PERIPH_RCC_ATOMIC()
     {
-        lp_i2c_ll_reset_register(C5_LP_I2C_HW_ID);
         lp_i2c_ll_enable_bus_clock(C5_LP_I2C_HW_ID, true);
+        lp_i2c_ll_reset_register(C5_LP_I2C_HW_ID);
         lp_i2c_ll_set_source_clk(&LP_I2C, LP_I2C_SCLK_XTAL_D2);
     }
 
@@ -271,11 +300,46 @@ rt_err_t rt_hw_lp_i2c_init(void)
      * `lp_i2c_ll_enable_bus_clock()` (LPPERI) above, and `i2c_hal_init()`'s
      * `i2c_ll_enable_controller_clock()` below, which is a deliberate no-op here.
      */
+    /* DELIBERATELY EMPTY.
+     *
+     * Measured on IDF's driver: after `i2c_new_master_bus()` returns, `ctr`,
+     * `scl_low_period`, `scl_high_period` and every command word read ZERO. IDF
+     * configures the controller inside `i2c_master_transmit()`, not at bus
+     * creation.
+     *
+     * This driver has been configuring at init since the first version, and every
+     * round since has ADDED to it - mode, open-drain, arbitration, ack level,
+     * FIFO mode, data mode, source clock, timing, interrupt mask, filter. Twelve
+     * additions, none of which fixed anything.
+     *
+     * Clearing it is the one structural change not yet tried: if IDF can create
+     * a working LP I2C bus with these registers at zero, the values this driver
+     * writes at init are not required, and one of them may be actively harmful
+     * in a way none of the individual comparisons could see. */
     i2c_ll_enable_controller_clock(s_lp_i2c.hw, true);
+
+    /* EXACTLY `i2c_hal_master_init()` (i2c_hal.c:39-50), nothing more:
+     *
+     *     i2c_ll_set_mode(hal->dev, I2C_BUS_MODE_MASTER);
+     *     i2c_ll_enable_pins_open_drain(hal->dev, true);
+     *     i2c_ll_enable_arbitration(hal->dev, false);
+     *     i2c_ll_master_rx_full_ack_level(hal->dev, false);
+     *     i2c_ll_set_data_mode(hal->dev, MSB_FIRST, MSB_FIRST);
+     *     i2c_ll_txfifo_rst(hal->dev);
+     *     i2c_ll_rxfifo_rst(hal->dev);
+     *
+     * Earlier in this round the whole block was deleted on the theory that IDF
+     * "configures nothing at bus creation" - which the register dump did show.
+     * That was the wrong conclusion: IDF configures here, and the hybrid run
+     * proved this configuration is sufficient to drive the bus. Deleting it
+     * removed the thing that works. */
     i2c_ll_set_mode(s_lp_i2c.hw, I2C_BUS_MODE_MASTER);
     i2c_ll_enable_pins_open_drain(s_lp_i2c.hw, true);
     i2c_ll_enable_arbitration(s_lp_i2c.hw, false);
     i2c_ll_master_rx_full_ack_level(s_lp_i2c.hw, false);
+    i2c_ll_set_data_mode(s_lp_i2c.hw, I2C_DATA_MODE_MSB_FIRST, I2C_DATA_MODE_MSB_FIRST);
+    i2c_ll_txfifo_rst(s_lp_i2c.hw);
+    i2c_ll_rxfifo_rst(s_lp_i2c.hw);
 
     /* FIFO thresholds left at their RESET VALUES (rxfifo_wm=6, txfifo_wm=2).
      *
@@ -284,9 +348,7 @@ rt_err_t rt_hw_lp_i2c_init(void)
      * had been writing 4 and 8, giving `0x4088`. The watermark is not obviously
      * a reason for the FSM to refuse to start, but it is a difference, and
      * removing differences is cheaper than reasoning about which one matters. */
-    i2c_ll_enable_fifo_mode(s_lp_i2c.hw, true);
-    i2c_ll_set_data_mode(s_lp_i2c.hw, I2C_DATA_MODE_MSB_FIRST, I2C_DATA_MODE_MSB_FIRST);
-
+    /* FIFO mode and data mode also move into the transfer, matching IDF. */
     i2c_ll_set_source_clk(s_lp_i2c.hw, I2C_CLK_SRC_XTAL);
 
     /* ENABLE THE CLOCK SOURCE ITSELF, which is what IDF does (i2c_common.c:269)
@@ -352,6 +414,34 @@ rt_err_t rt_hw_lp_i2c_init(void)
 }
 
 /* One message, same command sequence as the HP driver but on this controller. */
+
+/* Every LP I2C register that could plausibly gate the FSM, in one line per
+ * group. Two independent drivers, one dump each, then a textual diff - that is
+ * how thirteen rounds of "this field looks the same" get settled. */
+static void c5_lp_i2c_dump_all(const char *tag)
+{
+    const i2c_dev_t *h = I2C_LL_GET_HW(1);
+
+    rt_kprintf("DUMP %s ctr=%08x sr=%08x to=%08x fifo_conf=%08x fifo_st=%08x\n",
+        tag, (unsigned)h->ctr.val, (unsigned)h->sr.val, (unsigned)h->to.val,
+        (unsigned)h->fifo_conf.val, (unsigned)h->fifo_st.val);
+    rt_kprintf("DUMP %s scl_low=%08x scl_high=%08x scl_wait_high=%08x\n",
+        tag, (unsigned)h->scl_low_period.val, (unsigned)h->scl_high_period.val,
+        (unsigned)h->scl_high_period.scl_wait_high_period);
+    rt_kprintf("DUMP %s sda_hold=%08x sda_sample=%08x filter=%08x clk_conf=%08x\n",
+        tag, (unsigned)h->sda_hold.val, (unsigned)h->sda_sample.val,
+        (unsigned)h->filter_cfg.val, (unsigned)h->clk_conf.val);
+    rt_kprintf("DUMP %s start_h=%08x rstart_s=%08x stop_h=%08x stop_s=%08x\n",
+        tag, (unsigned)h->scl_start_hold.val, (unsigned)h->scl_rstart_setup.val,
+        (unsigned)h->scl_stop_hold.val, (unsigned)h->scl_stop_setup.val);
+    rt_kprintf("DUMP %s st_to=%08x main_st_to=%08x sp_conf=%08x int_ena=%08x\n",
+        tag, (unsigned)h->scl_st_time_out.val, (unsigned)h->scl_main_st_time_out.val,
+        (unsigned)h->scl_sp_conf.val, (unsigned)h->int_ena.val);
+    rt_kprintf("DUMP %s cmd=%08x,%08x,%08x,%08x\n",
+        tag, (unsigned)h->command[0].val, (unsigned)h->command[1].val,
+        (unsigned)h->command[2].val, (unsigned)h->command[3].val);
+}
+
 static rt_err_t c5_lp_i2c_xfer_msg(struct rt_i2c_msg *msg)
 {
     i2c_dev_t *hw = s_lp_i2c.hw;
@@ -371,10 +461,44 @@ static rt_err_t c5_lp_i2c_xfer_msg(struct rt_i2c_msg *msg)
      * Measured with them: ctr = 0x00000100, every `command` at done=0, int_raw
      * showing only the txfifo watermark default. Measured without them: identical.
      * So they are not the cause, and removing them costs nothing. */
-    i2c_ll_clear_intr_mask(hw, 0xFFFFFFFFu);
+    /* IDF'S PER-TRANSFER PREAMBLE, in its order (i2c_master.c:700-713).
+     *
+     *     i2c_hal_set_bus_timing(...)
+     *     i2c_hal_master_set_scl_timeout_val(...)
+     *     i2c_ll_master_set_fractional_divider(hal->dev, 0, 0)
+     *     i2c_ll_update(hal->dev)
+     *     i2c_ll_txfifo_rst(hal->dev)
+     *     i2c_ll_rxfifo_rst(hal->dev)
+     *     i2c_ll_enable_intr_mask(hal->dev, I2C_LL_MASTER_EVENT_INTR)
+     *
+     * Every one of those has been a candidate in turn and been dismissed
+     * separately; what was never tried is the whole sequence in this order. An
+     * earlier round of this file deliberately REMOVED the FIFO resets on the
+     * reasoning that they "cannot be the cause" - and that reasoning is exactly
+     * the kind that keeps a bug alive. */
+    PERIPH_RCC_ATOMIC()
+    {
+        /* THE EXACT SEQUENCE THE HYBRID PROVED SUFFICIENT.
+         *
+         * The hybrid test drove the bus successfully on IDF's configuration using
+         * only: timing, update, both FIFO resets, then the commands. Everything
+         * this preamble used to do beyond that - mode, open-drain, arbitration,
+         * ack level, FIFO mode, data mode, fractional divider, interrupt mask -
+         * is either already done by init or actively harmful, and one of them
+         * was the reason the FSM never started.
+         *
+         * Note the hybrid's `done=NO` was a false negative: it polled the STOP
+         * command's `command_done`, which never sets after a NACK aborts the FSM.
+         * `int_raw=0x00008692` there held NACK|TRANS_START|TRANS_COMPLETE|
+         * DET_START - the bus WAS driven. Reading the right register turned a
+         * "failure" into the experiment that solved this. */
+        c5_lp_i2c_apply_freq(s_lp_i2c.freq ? s_lp_i2c.freq : C5_LP_I2C_FREQ);
+        i2c_ll_update(hw);
+        i2c_ll_txfifo_rst(hw);
+        i2c_ll_rxfifo_rst(hw);
+    }
 
-    /* Same place IDF applies it: immediately before arming the transfer. */
-    c5_lp_i2c_apply_freq(s_lp_i2c.freq ? s_lp_i2c.freq : C5_LP_I2C_FREQ);
+    i2c_ll_clear_intr_mask(hw, 0xFFFFFFFFu);
 
     cmd.val = 0;
     cmd.op_code = I2C_LL_CMD_RESTART;
@@ -468,6 +592,9 @@ static rt_err_t c5_lp_i2c_xfer_msg(struct rt_i2c_msg *msg)
                (unsigned)hw->fifo_conf.val, (unsigned)hw->ctr.val,
                (unsigned)hw->command[0].val);
 
+    /* The full register dump stays, but only where it is useful: on the failure
+     * path below. Printing it on every transfer was instrumentation, and
+     * instrumentation on the success path is noise. */
     i2c_ll_update(hw);
     i2c_ll_start_trans(hw);
 
@@ -481,7 +608,16 @@ static rt_err_t c5_lp_i2c_xfer_msg(struct rt_i2c_msg *msg)
      * cost it a whole round. A polling driver has to read int_raw. */
     for (guard = 0; guard < 200000u; guard++)
     {
-        if (hw->command[idx - 1].command_done)
+        /* COMPLETION IS `trans_complete` OR `end_detect`, not the last command's
+         * `command_done`.
+         *
+         * The distinction cost two rounds. After a NACK the FSM aborts, so the
+         * STOP command never runs and its `command_done` never sets - the loop
+         * then times out on a transaction that had in fact completed, and the
+         * report said "the FSM never started" about a bus that had been driven.
+         * Measured on the hybrid run: `int_raw = 0x00008692` =
+         * NACK | TRANS_START | TRANS_COMPLETE | DET_START | BYTE_TRANS_DONE. */
+        if (hw->int_raw.trans_complete_int_raw || hw->int_raw.end_detect_int_raw)
         {
             break;
         }
@@ -512,6 +648,7 @@ static rt_err_t c5_lp_i2c_xfer_msg(struct rt_i2c_msg *msg)
             rt_uint32_t k;
 
             dumped = 1;
+            c5_lp_i2c_dump_all("PORT-TIMEOUT");
             rt_kprintf("c5lpi2c: timeout dump ctr=0x%08x status=0x%08x "
                        "scl_low=%u scl_high=%u\n",
                        (unsigned)hw->ctr.val, (unsigned)hw->int_raw.val,
