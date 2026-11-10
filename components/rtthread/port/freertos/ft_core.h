@@ -40,6 +40,29 @@ typedef long            ft_base_t;
 typedef unsigned long   ft_ubase_t;
 typedef rt_uint32_t     ft_tick_t;
 
+/*
+ * FT_IRAM - "this function is reachable from an interrupt handler".
+ *
+ * Not an optimisation. Under SMP the Bluetooth controller's ISR calls into this
+ * shim (bt.c's semphr_give_from_isr_wrapper -> xQueueGiveFromISR -> ft_ipc_*),
+ * and it can do so while the other core is inside a flash write with the
+ * instruction cache disabled. A flash-resident callee in that window takes a
+ * cache error and resets the chip. Measured, twice, before this macro existed:
+ *
+ *   PC 0x4204a426  xQueueGiveFromISR     (flash)  <- BLE ISR, cache off
+ *   PC 0x4200d1d2  ft_ipc_resolve        (flash)  <- same
+ *
+ * Anything on that path carries FT_IRAM on both its declaration and its
+ * definition, so a mismatch is a compile error rather than a reset at runtime.
+ * The attribute expands to nothing on a non-Xtensa target, where the cache is
+ * not shared with flash the same way.
+ */
+#if defined(__XTENSA__)
+#  define FT_IRAM           __attribute__((section(".iram1")))
+#else
+#  define FT_IRAM
+#endif
+
 #define ftPASS              ((ft_base_t)1)
 #define ftFAIL              ((ft_base_t)0)
 
@@ -163,7 +186,7 @@ struct ft_ipc_stub
     struct ft_ipc *real;
 };
 
-struct ft_ipc *ft_ipc_resolve(void *handle);
+struct ft_ipc *FT_IRAM ft_ipc_resolve(void *handle);
 
 /** Static creation via a stub. Returns the caller's block as the handle. */
 struct ft_ipc *ft_ipc_create_stub(ft_ubase_t length, ft_ubase_t item_size,
@@ -200,10 +223,10 @@ void *ft_ipc_mutex_holder(struct ft_ipc *ipc);
 void ft_ipc_delete(struct ft_ipc *ipc);
 
 /** Post one item. Returns FT_OK, FT_ERR_FULL or FT_ERR_TIMEOUT. */
-int ft_ipc_send(struct ft_ipc *ipc, const void *item, ft_tick_t ticks);
+int FT_IRAM ft_ipc_send(struct ft_ipc *ipc, const void *item, ft_tick_t ticks);
 
 /** Non-blocking post. @p woken is set to 1 when a task was made ready. */
-int ft_ipc_send_isr(struct ft_ipc *ipc, const void *item, ft_base_t *woken);
+int FT_IRAM ft_ipc_send_isr(struct ft_ipc *ipc, const void *item, ft_base_t *woken);
 
 /** Fetch one item. Returns FT_OK, FT_ERR_EMPTY or FT_ERR_TIMEOUT. */
 int ft_ipc_receive(struct ft_ipc *ipc, void *item, ft_tick_t ticks);
@@ -214,9 +237,9 @@ int ft_ipc_receive_isr(struct ft_ipc *ipc, void *item, ft_base_t *woken);
 int ft_ipc_take(struct ft_ipc *ipc, ft_tick_t ticks);
 
 /** Give a semaphore or release a mutex. */
-int ft_ipc_give(struct ft_ipc *ipc);
+int FT_IRAM ft_ipc_give(struct ft_ipc *ipc);
 
-int ft_ipc_give_isr(struct ft_ipc *ipc, ft_base_t *woken);
+int FT_IRAM ft_ipc_give_isr(struct ft_ipc *ipc, ft_base_t *woken);
 
 ft_base_t  ft_ipc_is_empty(struct ft_ipc *ipc);
 ft_ubase_t ft_ipc_messages_waiting(struct ft_ipc *ipc);

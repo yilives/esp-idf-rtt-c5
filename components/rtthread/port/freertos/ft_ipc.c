@@ -330,7 +330,7 @@ struct ft_ipc *ft_ipc_create_static(ft_ubase_t length, ft_ubase_t item_size,
  * flags, so its first word cannot be FT_IPC_MAGIC by accident.
  */
 
-struct ft_ipc *ft_ipc_resolve(void *handle)
+struct ft_ipc *FT_IRAM ft_ipc_resolve(void *handle)
 {
     struct ft_ipc_stub *stub;
 
@@ -633,7 +633,7 @@ static void ft_ipc_pop(struct ft_ipc *q, void *item)
     rt_hw_interrupt_enable(level);
 }
 
-int ft_ipc_send(struct ft_ipc *ipc, const void *item, ft_tick_t ticks)
+int FT_IRAM ft_ipc_send(struct ft_ipc *ipc, const void *item, ft_tick_t ticks)
 {
     ipc = ft_ipc_resolve(ipc);
     if (ipc == RT_NULL)
@@ -678,7 +678,7 @@ int ft_ipc_send(struct ft_ipc *ipc, const void *item, ft_tick_t ticks)
     return FT_OK;
 }
 
-int ft_ipc_send_isr(struct ft_ipc *ipc, const void *item, ft_base_t *woken)
+int FT_IRAM ft_ipc_send_isr(struct ft_ipc *ipc, const void *item, ft_base_t *woken)
 {
     ipc = ft_ipc_resolve(ipc);
     if (woken != RT_NULL)
@@ -895,7 +895,7 @@ int ft_ipc_take(struct ft_ipc *ipc, ft_tick_t ticks)
     return ft_ipc_take_item(ipc, RT_NULL, ticks);
 }
 
-int ft_ipc_give(struct ft_ipc *ipc)
+int FT_IRAM ft_ipc_give(struct ft_ipc *ipc)
 {
     ipc = ft_ipc_resolve(ipc);
     if (ipc == RT_NULL)
@@ -939,7 +939,7 @@ int ft_ipc_give(struct ft_ipc *ipc)
     return ft_ipc_send(ipc, RT_NULL, FT_NO_WAIT);
 }
 
-int ft_ipc_give_isr(struct ft_ipc *ipc, ft_base_t *woken)
+int FT_IRAM ft_ipc_give_isr(struct ft_ipc *ipc, ft_base_t *woken)
 {
     ipc = ft_ipc_resolve(ipc);
     if (ipc != RT_NULL &&
