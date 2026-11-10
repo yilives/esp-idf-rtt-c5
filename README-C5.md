@@ -499,6 +499,38 @@ and IO3 as the PWM test — both had already moved to IO23/IO24 — and did not 
 the LP peripherals existed. **A pin table that is not maintained is worse than
 none: it certifies a conflict.**
 
+## Every command run twice
+
+The CAN bug was a **repeatability** defect: the driver worked once per boot and
+nothing noticed, because every self test ran exactly once. Running everything
+twice found one more.
+
+```
+c5spiloop -> PASS, loopback identical
+c5spiloop -> attach to spi0 failed
+```
+
+`rt_spi_bus_attach_device()` ends in `rt_device_register(device, "spiloop", ...)`
+(`dev_spi.c:164`), and the object manager refuses a duplicate name. The
+`struct rt_spi_device` is `static`, so it survives between invocations and is
+already the registered device — the second attach was being asked to create
+something that existed and was correct. Fixed with `rt_device_find()` first.
+
+**A test that can only pass once is not testing the driver, it is testing the
+first call.**
+
+Everything else survives a second run: `c5rmt`, `c5pcnt`, `c5mcpwm`, `c5tsens`,
+`c5adc`, `c5dma`, `c5parlio`, `c5usj`, `c5heap`, `c5psram`, `c5ulp`, `c5lpi2c`,
+`c5lpuart` — all PASS twice in one boot, and `c5can` five times interleaved with
+`c5twai`.
+
+### What the sweep does not cover
+
+Defects that need a **reboot** to appear, and defects that need a **specific other
+command** to have run first. The interleaved `c5can`/`c5twai` run covers one such
+pair; the rest are not covered, and saying so is more useful than implying the
+sweep was exhaustive.
+
 ## The pre-build guard check
 
 Nine separate times, an Xtensa debugging probe added to shared code broke the
