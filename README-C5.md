@@ -359,6 +359,29 @@ The comparison also found a real defect in this port: `i2c_del_master_bus()`
 panics with `assert failed: vSemaphoreDeleteWithCaps` because the FreeRTOS shim's
 semaphore wrapper refuses a delete it did not hand out.
 
+## Two peripherals, one GDMA channel
+
+`c5parlio` passed on its own and failed after `c5dma` in the same boot — 88 of 128
+bits, `dma_txint=0x1` (TX_DONE) while PARLIO's own status stayed empty. Both
+drove TX channel 0.
+
+Five cleanups were tried and **none worked**: disconnect on exit, disconnect and
+reset before configuring, explicit `owner_check(false)`, reset both halves on
+exit, and sizing the burst to the frame. The failure moved (88 → 97 bits) without
+ever passing.
+
+The fix is not more cleanup. The C5 has **three** channel pairs
+(`GDMA_LL_AHB_PAIRS_PER_GROUP` is 3), so they did not have to share:
+
+```c
+#define C5_GDMA_TX_CH          0    /* the M2M self test */
+#define C5_PARLIO_GDMA_TX_CH   1    /* PARLIO, its own */
+```
+
+A shared resource with per-caller configuration is a bug that cleanup hides
+rather than fixes. The give-away was that the number moved and never passed:
+each attempt was covering *some* of the relevant fields and never all of them.
+
 ## The pre-build guard check
 
 Nine separate times, an Xtensa debugging probe added to shared code broke the
