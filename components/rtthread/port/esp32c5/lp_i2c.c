@@ -62,10 +62,13 @@
 #include "soc/rtc_io_channel.h"
 #include "hal/i2c_ll.h"
 #include "hal/rtc_io_ll.h"
+#include "driver/rtc_io.h"
+#include "soc/gpio_sig_map.h"
 #include "hal/gpio_ll.h"
 #include "soc/gpio_sig_map.h"
 #include "esp_private/periph_ctrl.h"
 #include "esp_private/esp_clk.h"
+#include "esp_private/esp_clk_tree_common.h"
 #include "esp_attr.h"
 
 #if defined(SOC_LP_I2C_SUPPORTED)
@@ -99,6 +102,34 @@ static void c5_lp_i2c_set_pins(void)
     /* LP_GPIO's clock is in LPPERI and has to be on before any LP_IO_MUX write
      * lands; the register reads back its old value otherwise. */
     PERIPH_RCC_ATOMIC() { rtcio_ll_enable_io_clock(true); }
+
+    /* Use `rtc_gpio_*`, not the raw `rtcio_ll_*` calls.
+     *
+     * Found by comparing against IDF's own `s_lp_i2c_pins_config()`
+     * (i2c_common.c:358-411). IDF does rtc_gpio_init(), then
+     * rtc_gpio_set_direction(INPUT_OUTPUT_OD), then rtc_gpio_iomux_input().
+     * `rtc_gpio_set_direction(INPUT_OUTPUT_OD)` sets the pad's function select
+     * to RTC, enables the RTC GPIO output driver and sets open-drain - in that
+     * order, with the RTC domain already clocked.
+     *
+     * The hand-written sequence here went straight to
+     * `rtcio_ll_iomux_func_sel()` and enabled the digital-side input, which
+     * leaves the pad's RTC output stage off. The peripheral then sees an
+     * idle-high line it cannot pull low, which is exactly the observed state:
+     * no start condition, no interrupt event, every register readable. */
+    rtc_gpio_init((gpio_num_t)C5_LP_I2C_SDA_PIN);
+    rtc_gpio_set_direction((gpio_num_t)C5_LP_I2C_SDA_PIN, RTC_GPIO_MODE_INPUT_OUTPUT_OD);
+    rtc_gpio_pulldown_dis((gpio_num_t)C5_LP_I2C_SDA_PIN);
+    rtc_gpio_pullup_en((gpio_num_t)C5_LP_I2C_SDA_PIN);
+    rtc_gpio_iomux_input((gpio_num_t)C5_LP_I2C_SDA_PIN, C5_LP_I2C_MUX_FUNC,
+                         I2CEXT0_SDA_IN_IDX);
+
+    rtc_gpio_init((gpio_num_t)C5_LP_I2C_SCL_PIN);
+    rtc_gpio_set_direction((gpio_num_t)C5_LP_I2C_SCL_PIN, RTC_GPIO_MODE_INPUT_OUTPUT_OD);
+    rtc_gpio_pulldown_dis((gpio_num_t)C5_LP_I2C_SCL_PIN);
+    rtc_gpio_pullup_en((gpio_num_t)C5_LP_I2C_SCL_PIN);
+    rtc_gpio_iomux_input((gpio_num_t)C5_LP_I2C_SCL_PIN, C5_LP_I2C_MUX_FUNC,
+                         I2CEXT0_SCL_IN_IDX);
 
     /* SDA = IO2, SCL = IO3, both open-drain with the pull-up doing the high
      * level. `RTCIO_LL_FUNC_DIGITAL` puts the pad on the digital side - the LP
@@ -257,6 +288,26 @@ rt_err_t rt_hw_lp_i2c_init(void)
     i2c_ll_set_data_mode(s_lp_i2c.hw, I2C_DATA_MODE_MSB_FIRST, I2C_DATA_MODE_MSB_FIRST);
 
     i2c_ll_set_source_clk(s_lp_i2c.hw, I2C_CLK_SRC_XTAL);
+
+    /* ENABLE THE CLOCK SOURCE ITSELF, which is what IDF does (i2c_common.c:269)
+     * and what this driver never did.
+     *
+     * `lp_i2c_ll_set_source_clk()` only SELECTS the source; it does not turn it
+     * on. IDF calls `esp_clk_tree_enable_src(clk_src, true)` for exactly this
+     * reason, and without it the peripheral can be fully reachable - `date`
+     * reads, registers accept writes - while its clock tree input produces
+     * nothing and the FSM never advances. That matches every observation here:
+     * commands writable, `command_done` never set, `int_raw` empty.
+     *
+     * This is the first candidate that was a genuine omission rather than a
+     * difference in values, so it is the one worth trying first. */
+    {
+        esp_err_t clk_err = esp_clk_tree_enable_src(
+            (soc_module_clk_t)LP_I2C_SCLK_XTAL_D2, true);
+
+        rt_kprintf("c5lpi2c: esp_clk_tree_enable_src(XTAL_D2) -> 0x%x\n",
+                   (unsigned)clk_err);
+    }
 
     /* Two calls IDF makes that this driver did not (i2c_master.c:133,136).
      *

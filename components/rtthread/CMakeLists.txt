@@ -986,7 +986,7 @@ target_link_libraries(${COMPONENT_LIB} PRIVATE idf::esp_hal_ledc idf::esp_hal_i2
                     # esp_adc/include/esp_adc on the compile line - the same
                     # measured rule as the HAL aliases above, where PRIV_REQUIRES
                     # alone left the -I list unchanged.
-                    idf::esp_adc idf::esp_mm idf::esp_timer idf::esp_driver_i2c
+                    idf::esp_adc idf::esp_mm idf::esp_timer idf::esp_driver_i2c idf::esp_driver_gpio
                     # The eFuse ADC calibration table. Only for reading back which
                     # calibration version this part carries, so `c5adc` can say
                     # whether its numbers came from eFuse or from run-time

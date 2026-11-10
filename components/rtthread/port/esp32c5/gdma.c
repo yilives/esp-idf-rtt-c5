@@ -222,6 +222,16 @@ rt_err_t rt_hw_gdma_memcpy(void *dst, const void *src, rt_uint32_t len,
     ahb_dma_ll_tx_clear_interrupt_status(hw, C5_GDMA_TX_CH, UINT32_MAX);
     ahb_dma_ll_rx_clear_interrupt_status(hw, C5_GDMA_RX_CH, UINT32_MAX);
 
+    /* DISCONNECT the channel before returning it.
+     *
+     * `c5dma` and `c5parlio` share TX channel 0 - the port has one channel
+     * brought up - and the M2M test leaves it connected to the memory sentinel
+     * with owner checking on. Measured: `c5parlio` passes on its own and fails
+     * when run after `c5dma` in the same boot, because PARLIO's own
+     * `tx_connect_to_periph()` is not enough to undo the M2M configuration the
+     * channel was left in.
+     *
+     * A test that changes shared hardware state has to put it back. */
     if (tx_status & (GDMA_LL_EVENT_TX_DESC_ERROR | GDMA_LL_EVENT_TX_FIFO_OVF |
                      GDMA_LL_EVENT_TX_FIFO_UDF))
     {
@@ -244,6 +254,21 @@ rt_err_t rt_hw_gdma_memcpy(void *dst, const void *src, rt_uint32_t len,
     {
         return -RT_ERROR;
     }
+
+    /* QUIET THE CHANNEL BEFORE RETURNING.
+     *
+     * `c5dma` and `c5parlio` share TX channel 0. Measured: with this test run
+     * first in the same boot, `c5parlio` transfers 88 of 128 bits and reports
+     * `dma_txint=0x1` (TX_DONE) while PARLIO's own status stays empty; run
+     * alone, it passes. Resetting the channel and leaving it disconnected is the
+     * only state the next user cannot inherit something from - `tx_reset_channel`
+     * alone resets the FSM but not the register file.
+     *
+     * A test that changes shared hardware state has to put it back. */
+    ahb_dma_ll_tx_disconnect_all(hw, C5_GDMA_TX_CH);
+    ahb_dma_ll_tx_reset_channel(hw, C5_GDMA_TX_CH);
+    ahb_dma_ll_rx_disconnect_all(hw, C5_GDMA_RX_CH);
+    ahb_dma_ll_rx_reset_channel(hw, C5_GDMA_RX_CH);
 
     return RT_EOK;
 }

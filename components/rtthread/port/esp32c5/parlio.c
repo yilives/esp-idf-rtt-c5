@@ -76,7 +76,6 @@
 #include "port_pcnt.h"
 
 #define C5_PARLIO_GROUP     0
-#define C5_GDMA_TX_CH       0
 
 static parl_io_dev_t *s_parlio;
 static rt_bool_t      s_parlio_ready;
@@ -266,16 +265,20 @@ rt_err_t rt_hw_parlio_tx(const rt_uint8_t *buf, rt_uint32_t len,
     desc.buffer = (void *)buf;
     desc.next = RT_NULL;
 
-    ahb_dma_ll_tx_reset_channel(dma, C5_GDMA_TX_CH);
+    ahb_dma_ll_tx_reset_channel(dma, C5_PARLIO_GDMA_TX_CH);
 
     /* THE PERIPHERAL ID IS THE TRIGGER, and it is not the M2M sentinel.
      * SOC_GDMA_TRIG_PERIPH_PARLIO0 is 9 (gdma_channel.h); writing anything else
      * here makes the channel push data into a peripheral that never reads it, and
      * the frame silently produces no clocks. */
-    ahb_dma_ll_tx_connect_to_periph(dma, C5_GDMA_TX_CH,
+    ahb_dma_ll_tx_connect_to_periph(dma, C5_PARLIO_GDMA_TX_CH,
                                     SOC_GDMA_TRIG_PERIPH_PARLIO0);
-    ahb_dma_ll_tx_set_eof_mode(dma, C5_GDMA_TX_CH, 1);
-    ahb_dma_ll_tx_enable_auto_write_back(dma, C5_GDMA_TX_CH, false);
+    ahb_dma_ll_tx_set_eof_mode(dma, C5_PARLIO_GDMA_TX_CH, 1);
+    ahb_dma_ll_tx_enable_auto_write_back(dma, C5_PARLIO_GDMA_TX_CH, false);
+
+    /* Owner check off, matching IDF (parlio_tx.c:149). Set explicitly so the
+     * value does not depend on what the channel was left in. */
+    ahb_dma_ll_tx_enable_owner_check(dma, C5_PARLIO_GDMA_TX_CH, false);
 
     /* Burst configuration, which M2M did not need and a peripheral transfer does.
      *
@@ -285,11 +288,16 @@ rt_err_t rt_hw_parlio_tx(const rt_uint8_t *buf, rt_uint32_t len,
      * exactly like "the peripheral never requested anything": the DMA channel
      * sits with zero interrupt status while the descriptor is still owned by the
      * engine. */
-    ahb_dma_ll_tx_enable_data_burst(dma, C5_GDMA_TX_CH, true);
-    ahb_dma_ll_tx_set_burst_size(dma, C5_GDMA_TX_CH, 32);
-    ahb_dma_ll_tx_enable_descriptor_burst(dma, C5_GDMA_TX_CH, true);
-    ahb_dma_ll_tx_set_desc_addr(dma, C5_GDMA_TX_CH, (uint32_t)&desc);
-    ahb_dma_ll_tx_clear_interrupt_status(dma, C5_GDMA_TX_CH, UINT32_MAX);
+    ahb_dma_ll_tx_enable_data_burst(dma, C5_PARLIO_GDMA_TX_CH, true);
+    /* Burst no larger than the frame. IDF uses 32 because its buffers are large;
+     * a 16-byte frame with a 32-byte burst asks the engine to read past the
+     * descriptor's length, and the result here was a short transfer (96 of 128
+     * bits) rather than an error. */
+    ahb_dma_ll_tx_set_burst_size(dma, C5_PARLIO_GDMA_TX_CH,
+                                 (len >= 32u) ? 32u : 4u);
+    ahb_dma_ll_tx_enable_descriptor_burst(dma, C5_PARLIO_GDMA_TX_CH, true);
+    ahb_dma_ll_tx_set_desc_addr(dma, C5_PARLIO_GDMA_TX_CH, (uint32_t)&desc);
+    ahb_dma_ll_tx_clear_interrupt_status(dma, C5_PARLIO_GDMA_TX_CH, UINT32_MAX);
 
     /* RESET THE TX CLOCK DIVIDER, once per transaction, as IDF does.
      *
@@ -319,7 +327,7 @@ rt_err_t rt_hw_parlio_tx(const rt_uint8_t *buf, rt_uint32_t len,
         parlio_ll_tx_enable_clock(s_parlio, true);
     }
 
-    ahb_dma_ll_tx_start(dma, C5_GDMA_TX_CH);
+    ahb_dma_ll_tx_start(dma, C5_PARLIO_GDMA_TX_CH);
 
     /* DO NOT WAIT FOR tx_ready.
      *
@@ -358,8 +366,8 @@ rt_err_t rt_hw_parlio_tx(const rt_uint8_t *buf, rt_uint32_t len,
                        (unsigned)timeout_ms,
                        (unsigned)parlio_ll_tx_get_interrupt_status(s_parlio),
                        (unsigned)s_parlio->st.val,
-                       (unsigned)ahb_dma_ll_tx_get_interrupt_status(dma, C5_GDMA_TX_CH, true),
-                       (unsigned)dma->channel[C5_GDMA_TX_CH].out.out_peri_sel.peri_out_sel_chn);
+                       (unsigned)ahb_dma_ll_tx_get_interrupt_status(dma, C5_PARLIO_GDMA_TX_CH, true),
+                       (unsigned)dma->channel[C5_PARLIO_GDMA_TX_CH].out.out_peri_sel.peri_out_sel_chn);
             rt_kprintf("c5parlio: tx_st0=0x%08x tx_cnt=%u fifo_rd_bits=%u\n",
                        (unsigned)s_parlio->tx_st0.val,
                        (unsigned)s_parlio->tx_st0.tx_cnt,
@@ -369,7 +377,7 @@ rt_err_t rt_hw_parlio_tx(const rt_uint8_t *buf, rt_uint32_t len,
                 *out_bits = s_parlio->tx_st0.tx_fifo_rd_bit_cnt;
             }
             parlio_ll_tx_start(s_parlio, false);
-            ahb_dma_ll_tx_stop(dma, C5_GDMA_TX_CH);
+            ahb_dma_ll_tx_stop(dma, C5_PARLIO_GDMA_TX_CH);
             return -RT_ETIMEOUT;
         }
     }
@@ -388,7 +396,7 @@ rt_err_t rt_hw_parlio_tx(const rt_uint8_t *buf, rt_uint32_t len,
     {
         rt_uint32_t rd_bits = s_parlio->tx_st0.tx_fifo_rd_bit_cnt;
         rt_uint32_t sub = s_parlio->tx_st0.tx_cnt;
-        rt_uint32_t dma_bytes = ahb_dma_ll_tx_get_fifo_bytes(dma, C5_GDMA_TX_CH, 1);
+        rt_uint32_t dma_bytes = ahb_dma_ll_tx_get_fifo_bytes(dma, C5_PARLIO_GDMA_TX_CH, 1);
 
         if (out_bits)
         {
@@ -408,8 +416,8 @@ rt_err_t rt_hw_parlio_tx(const rt_uint8_t *buf, rt_uint32_t len,
     }
 
     parlio_ll_tx_start(s_parlio, false);
-    ahb_dma_ll_tx_stop(dma, C5_GDMA_TX_CH);
-    ahb_dma_ll_tx_clear_interrupt_status(dma, C5_GDMA_TX_CH, UINT32_MAX);
+    ahb_dma_ll_tx_stop(dma, C5_PARLIO_GDMA_TX_CH);
+    ahb_dma_ll_tx_clear_interrupt_status(dma, C5_PARLIO_GDMA_TX_CH, UINT32_MAX);
     parlio_ll_clear_interrupt_status(s_parlio, UINT32_MAX);
 
     return RT_EOK;

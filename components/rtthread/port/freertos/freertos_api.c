@@ -160,7 +160,7 @@ BaseType_t xQueueGenericSend(QueueHandle_t xQueue,
     return ft_result(ft_ipc_send(ft_ipc_resolve(xQueue), pvItemToQueue, xTicksToWait));
 }
 
-BaseType_t xQueueGenericSendFromISR(QueueHandle_t xQueue,
+BaseType_t IRAM_ATTR xQueueGenericSendFromISR(QueueHandle_t xQueue,
                                     const void *const pvItemToQueue,
                                     BaseType_t *const pxHigherPriorityTaskWoken,
                                     const BaseType_t xCopyPosition)
@@ -190,14 +190,14 @@ BaseType_t xQueueReceive(QueueHandle_t xQueue, void *const pvBuffer,
     return ft_result(ft_ipc_receive(ft_ipc_resolve(xQueue), pvBuffer, xTicksToWait));
 }
 
-BaseType_t xQueueReceiveFromISR(QueueHandle_t xQueue, void *const pvBuffer,
+BaseType_t IRAM_ATTR xQueueReceiveFromISR(QueueHandle_t xQueue, void *const pvBuffer,
                                 BaseType_t *const pxHigherPriorityTaskWoken)
 {
     return ft_result(ft_ipc_receive_isr(ft_ipc_resolve(xQueue), pvBuffer,
                                         (ft_base_t *)pxHigherPriorityTaskWoken));
 }
 
-BaseType_t xQueueIsQueueEmptyFromISR(const QueueHandle_t xQueue)
+BaseType_t IRAM_ATTR xQueueIsQueueEmptyFromISR(const QueueHandle_t xQueue)
 {
     return ft_ipc_is_empty(ft_ipc_resolve(xQueue));
 }
@@ -207,7 +207,7 @@ BaseType_t xQueueSemaphoreTake(QueueHandle_t xQueue, TickType_t xTicksToWait)
     return ft_result(ft_ipc_take(ft_ipc_resolve(xQueue), xTicksToWait));
 }
 
-BaseType_t xQueueGiveFromISR(QueueHandle_t xQueue,
+BaseType_t IRAM_ATTR xQueueGiveFromISR(QueueHandle_t xQueue,
                              BaseType_t *const pxHigherPriorityTaskWoken)
 {
     return ft_result(ft_ipc_give_isr(ft_ipc_resolve(xQueue),
@@ -219,7 +219,7 @@ UBaseType_t uxQueueMessagesWaiting(const QueueHandle_t xQueue)
     return (UBaseType_t)ft_ipc_messages_waiting(ft_ipc_resolve(xQueue));
 }
 
-UBaseType_t uxQueueMessagesWaitingFromISR(const QueueHandle_t xQueue)
+UBaseType_t IRAM_ATTR uxQueueMessagesWaitingFromISR(const QueueHandle_t xQueue)
 {
     /* The count is read under an interrupt lock in ft_ipc_messages_waiting's
      * callers' world, but it is a plain word here: an ISR that shadows a pending
@@ -228,7 +228,7 @@ UBaseType_t uxQueueMessagesWaitingFromISR(const QueueHandle_t xQueue)
     return (UBaseType_t)ft_ipc_messages_waiting(ft_ipc_resolve(xQueue));
 }
 
-BaseType_t xQueueIsQueueFullFromISR(const QueueHandle_t xQueue)
+BaseType_t IRAM_ATTR xQueueIsQueueFullFromISR(const QueueHandle_t xQueue)
 {
     return (BaseType_t)(ft_ipc_spaces_available(ft_ipc_resolve(xQueue)) == 0);
 }
@@ -305,7 +305,7 @@ QueueSetMemberHandle_t xQueueSelectFromSet(QueueSetHandle_t xQueueSet,
                                                   xTicksToWait, NULL);
 }
 
-QueueSetMemberHandle_t xQueueSelectFromSetFromISR(QueueSetHandle_t xQueueSet)
+QueueSetMemberHandle_t IRAM_ATTR xQueueSelectFromSetFromISR(QueueSetHandle_t xQueueSet)
 {
     return (QueueSetMemberHandle_t)ft_qset_select_isr((void *)xQueueSet, NULL);
 }
@@ -479,7 +479,7 @@ TickType_t xTaskGetTickCount(void)
     return (TickType_t)ft_task_tick_count();
 }
 
-TickType_t xTaskGetTickCountFromISR(void)
+TickType_t IRAM_ATTR xTaskGetTickCountFromISR(void)
 {
     return (TickType_t)ft_task_tick_count_isr();
 }
@@ -602,7 +602,7 @@ BaseType_t xTaskAbortDelay(TaskHandle_t xTask)
     return (BaseType_t)ft_task_abort_delay(xTask);
 }
 
-BaseType_t xTaskResumeFromISR(TaskHandle_t xTaskToResume)
+BaseType_t IRAM_ATTR xTaskResumeFromISR(TaskHandle_t xTaskToResume)
 {
     ft_base_t woken = ftFAIL;
 
@@ -750,13 +750,44 @@ BaseType_t xQueueGenericGetStaticBuffers(QueueHandle_t xQueue,
                                          uint8_t **ppucQueueStorage,
                                          StaticQueue_t **ppxStaticQueue)
 {
-    if (xQueue == NULL || ppucQueueStorage == NULL || ppxStaticQueue == NULL)
+    /* EITHER OUTPUT MAY BE NULL, and treating that as a failure was a real bug.
+     *
+     * Upstream FreeRTOS accepts NULL for either pointer and fills only what it
+     * was given (queue.c:468-509: `if (ppucQueueStorage != NULL)` before writing,
+     * and the same check on `ppxStaticQueue` inside its own configASSERT). This
+     * shim rejected the call outright when `ppucQueueStorage` was NULL, and the
+     * `xSemaphoreGetStaticBuffer()` macro passes exactly that:
+     *
+     *     #define xSemaphoreGetStaticBuffer( xSemaphore, ppxSemaphoreBuffer )
+     *         xQueueGenericGetStaticBuffers( ( QueueHandle_t ) ( xSemaphore ),
+     *                                        NULL,
+     *                                        ( ppxSemaphoreBuffer ) )
+     *
+     * So every `vSemaphoreDeleteWithCaps()` returned pdFALSE and hit
+     * `configASSERT( xResult == pdTRUE )` - measured on this board as
+     *
+     *     assert failed: vSemaphoreDeleteWithCaps idf_additions.c:347
+     *
+     * from `i2c_del_master_bus()`. Nothing was wrong with the semaphore; the
+     * accessor refused a legal call.
+     *
+     * Only `ppxStaticQueue` is genuinely required, because that is the one the
+     * caller cannot do without. */
+    if (xQueue == NULL || ppxStaticQueue == NULL)
     {
         return pdFALSE;
     }
 
-    *ppucQueueStorage = (uint8_t *)ft_ipc_storage(ft_ipc_resolve(xQueue));
-    *ppxStaticQueue   = (StaticQueue_t *)ft_ipc_static_cb(ft_ipc_resolve(xQueue));
+    {
+        struct ft_ipc *ipc = ft_ipc_resolve(xQueue);
+
+        if (ppucQueueStorage != NULL)
+        {
+            *ppucQueueStorage = (uint8_t *)ft_ipc_storage(ipc);
+        }
+
+        *ppxStaticQueue = (StaticQueue_t *)ft_ipc_static_cb(ipc);
+    }
 
     return pdTRUE;
 }

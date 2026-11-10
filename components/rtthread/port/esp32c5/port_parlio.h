@@ -10,6 +10,20 @@ extern "C" {
 /* Pads. IO1 and IO14 are taken by MCPWM/USB; IO0 is RMT. IO5 is PCNT's own test
  * pin, so it is not reused here. IO13 is free since PCNT moved off it (section
  * 17j). IO12 is the console's RX, so not that either. */
+/* PARLIO gets its OWN GDMA channel.
+ *
+ * It shared channel 0 with the M2M self test, and no amount of cleanup on either
+ * side made them independent: measured, `c5dma` followed by `c5parlio` in one
+ * boot transferred 88 of 128 bits with `dma_txint=0x1` (TX_DONE) while PARLIO's
+ * own status stayed empty, and `c5parlio` alone (or twice in a row) passed. Two
+ * drivers taking turns on one channel have to agree on every field; the C5 has
+ * three channel pairs (`GDMA_LL_AHB_PAIRS_PER_GROUP` is 3), so they do not have
+ * to.
+ *
+ * Channel 1: its `peri_out_sel` is written explicitly rather than left as the
+ * hardware-assigned M2M id, so the value does not depend on the channel number. */
+#define C5_PARLIO_GDMA_TX_CH    1
+
 #define C5_PARLIO_CLK_PIN   13
 #define C5_PARLIO_DATA_PIN  14
 

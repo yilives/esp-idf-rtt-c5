@@ -157,6 +157,63 @@ int c5_lp_i2c_idf_selftest(void)
         }
     }
 
+    /* HYBRID: let IDF configure the controller, then drive it by hand.
+     *
+     * If this works, IDF's configuration leaves some state this port's init does
+     * not produce, and the difference is in the register dump below. If it still
+     * fails, the difference is not in configuration at all - it is in how the
+     * transfer is started, and the search narrows to those few instructions.
+     *
+     * One byte to 0x7F again: NACK means the bus was driven. */
+    {
+        i2c_dev_t *hw = I2C_LL_GET_HW(LP_I2C_NUM_0);
+        i2c_ll_hw_cmd_t cmd;
+        rt_uint32_t guard;
+        rt_bool_t done = RT_FALSE;
+
+        rt_kprintf("c5lpi2cidf: hybrid - careful, the bus is still owned by IDF\n");
+
+        /* Reuse IDF's timing but write the command ourselves, exactly as
+         * `c5lpi2c` does. */
+        cmd.val = 0;
+        cmd.op_code = I2C_LL_CMD_RESTART;
+        i2c_ll_master_write_cmd_reg(hw, cmd, 0);
+
+        cmd.val = 0;
+        cmd.op_code = I2C_LL_CMD_WRITE;
+        cmd.byte_num = 2;
+        cmd.ack_en = 1;
+        cmd.ack_exp = 0;
+        cmd.ack_val = 0;
+        i2c_ll_write_txfifo(hw, (const uint8_t *)"\xFE\x00", 2);
+        i2c_ll_master_write_cmd_reg(hw, cmd, 1);
+
+        cmd.val = 0;
+        cmd.op_code = I2C_LL_CMD_STOP;
+        i2c_ll_master_write_cmd_reg(hw, cmd, 2);
+
+        i2c_ll_update(hw);
+        i2c_ll_start_trans(hw);
+
+        for (guard = 0; guard < 200000u; guard++)
+        {
+            if (hw->command[2].command_done)
+            {
+                done = RT_TRUE;
+                break;
+            }
+        }
+
+        rt_kprintf("c5lpi2cidf: hybrid command done=%s int_raw=0x%08x\n",
+                   done ? "yes" : "NO", (unsigned)hw->int_raw.val);
+
+        if (done)
+        {
+            rt_kprintf("c5lpi2cidf: PASS - IDF's CONFIGURATION is what matters; the "
+                       "state it leaves behind is in the dump above\n");
+        }
+    }
+
     (void)i2c_master_bus_rm_device(dev);
     (void)i2c_del_master_bus(bus);
 
