@@ -86,7 +86,7 @@ useful to the next person.
 
 | | status |
 |---|---|
-| **LP I2C** | controller reachable, both clocks enabled, pads handed over, **the FSM never starts**. **IDF's own driver works on the same board** (§17y), so the fault is in this port's driver; six candidate differences are eliminated. |
+| ~~**LP I2C**~~ | **works since §17ab.** The FSM never started because a correct `rtc_gpio_*` pad setup was undone by four leftover raw `rtcio_ll_*` calls below it. |
 | **LP UART / LP peripherals** | not attempted — blocked on the same unknown as LP I2C |
 | **SDIO slave** | needs a host on the other end |
 | ~~`rt_malloc()` → PSRAM~~ | **done**: a `psram` memheap with auto-binding; 4 MB allocated, written and read back |
@@ -332,32 +332,28 @@ the systimer instead reads 0 ms.
 **Not proven:** the absence of a leak (a few bytes per hour is invisible to a two
 minute run), any driver or radio soak, and thermal drift.
 
-## The LP I2C question, and how it was narrowed
+## The LP I2C question, and how it was answered
 
-`c5lpi2c` drives the low-power I2C controller by hand and the FSM never starts:
-registers readable, both clocks enabled, pads idling high, command words well
-formed, and `int_raw` empty. Thirty rounds of that looked like hardware.
+For thirty rounds `c5lpi2c` was the one thing that did not work: registers
+readable, both clocks enabled, pads idling high, command words well formed, and
+`int_raw` empty. Then ESP-IDF's own LP I2C driver was run on the same board and
+worked, which proved the hardware was fine and the fault was in this port.
 
-It is not. **ESP-IDF's own LP I2C driver works on the same board**, same pads,
-same registers:
+Thirteen candidate differences were eliminated on evidence — command packing, the
+extra `END` command, FIFO/command order, watermark values, when timing is applied,
+two missing LL calls, the clock-source enable, the pad-configuration API, the
+interrupt mask, the per-transfer preamble, emptying the init, clock-before-reset,
+and the LP-domain clock registers (which turned out to be byte-identical).
 
-```
-c5lpi2cidf: i2c_master_transmit to 0x7F -> 0x108 (NACK - the bus WAS driven)
-```
+What found it was running IDF's driver and diffing **every** register: identical
+field for field apart from timing values, both correct for 100 kHz. A register
+comparison cannot see a pad that is no longer wired to the peripheral — and that
+is what narrowed the search to outside the controller.
 
-`0x108` is `ESP_ERR_INVALID_RESPONSE` = "master transmit receives NACK", and a NACK
-from a reserved address is the success case: a start condition went out and nine
-bits were clocked.
-
-Six differences were then found and removed — command packing, the extra `END`
-command, FIFO/command order, watermark values, when timing is applied, and two
-missing LL calls — and **none of them fixed it**. That is recorded rather than
-hidden: the next candidate is the LP-domain clock select, and it is named as a
-hypothesis, not a finding.
-
-The comparison also found a real defect in this port: `i2c_del_master_bus()`
-panics with `assert failed: vSemaphoreDeleteWithCaps` because the FreeRTOS shim's
-semaphore wrapper refuses a delete it did not hand out.
+The cause is in the section below. The comparison also found a real defect in this
+port: `i2c_del_master_bus()` panicked with `assert failed:
+vSemaphoreDeleteWithCaps`, because the FreeRTOS shim's static-buffer accessor
+rejected a NULL output pointer that upstream FreeRTOS accepts.
 
 ## Two peripherals, one GDMA channel
 
@@ -381,6 +377,85 @@ The fix is not more cleanup. The C5 has **three** channel pairs
 A shared resource with per-caller configuration is a bug that cleanup hides
 rather than fixes. The give-away was that the number moved and never passed:
 each attempt was covering *some* of the relevant fields and never all of them.
+
+## LP I2C: a fix undone by the code beneath it
+
+Thirteen rounds of "the FSM never starts", thirteen eliminated candidates, and the
+cause was a fix this port had already made:
+
+```c
+/* Use rtc_gpio_*, not the raw rtcio_ll_* calls. */
+rtc_gpio_iomux_input(pin, C5_LP_I2C_MUX_FUNC, 0);   /* pad -> LP peripheral */
+...
+rtcio_ll_function_select(pin, RTCIO_LL_FUNC_DIGITAL);  /* -> back to digital */
+rtcio_ll_iomux_func_sel(pin, C5_LP_I2C_MUX_FUNC);      /* -> IOMUX overwritten */
+```
+
+The pad was disconnected from the LP peripheral's input. Every symptom follows:
+registers readable, both clocks on, pads idling high **on the digital side**,
+command words correct, `int_raw` empty because no start condition was ever seen.
+
+```
+msh > c5lpi2c
+c5lpi2c: transfer to the reserved address 0x7F returned -8
+c5lpi2c: PASS (the controller drove a start condition, clocked nine bits
+         and saw the address NACKed)
+```
+
+**What finally found it** was running ESP-IDF's own driver and diffing every
+register: identical field for field apart from timing values, both correct for
+100 kHz. A register comparison cannot see a pad that is no longer wired to the
+peripheral — which is exactly what narrowed the search to outside the controller.
+
+**Not proven:** a successful data transfer. There is no I2C slave on this board, so
+a NACK from a reserved address is the strongest result available.
+
+## LP UART, and the bug that produces no warning at all
+
+Written in one round, after LP I2C took thirteen — because that failure named the
+three things to get right first: use `rtc_gpio_iomux_output/input()` and then
+touch nothing else on the pad, enable the bus clock before the reset pulse, and
+verify the capability macro.
+
+```
+msh > c5lpuart 115200
+c5lpuart: 16 byte(s) looped back byte-exact
+c5lpuart: 20 byte(s) looped back byte-exact (1 FIFO(s))
+c5lpuart: 40 byte(s) looped back byte-exact (2 FIFO(s))
+c5lpuart: PASS at 115200 baud
+```
+
+### `#if` on a macro that does not exist is not an error
+
+```c
+#if defined(SOC_LP_UART_NUM) && (SOC_LP_UART_NUM >= 1)
+```
+
+The real names on this part are `SOC_UART_LP_NUM` and `SOC_UART_HAS_LP_UART`. A
+misspelled macro in `#if` evaluates to 0, so **the whole file compiled to nothing**
+and the only symptom was `undefined reference to c5_lp_uart_selftest` three
+translation units away.
+
+### Two bugs in the test, both found by trying more than one case
+
+**Write-all-then-read loses bytes.** The LP receive FIFO is 16 bytes, so a 20-byte
+message overflows it while the CPU is still pushing the transmit side. 16 bytes
+passed at 115200; **20 bytes failed at 921600 with all 20 wrong.** The 115200 case
+was luck. Reading and writing are now interleaved.
+
+**Changing a baud divisor is not a plain register write.** `c5lpuart 921600`
+passed as the first call after boot and failed when it followed
+`c5lpuart 115200` — the init returns early once ready, so the second call rewrote
+the divisor with the loopback still on and both FIFOs holding data clocked at the
+old rate.
+
+### What it does not prove
+
+The loopback is **internal to the peripheral**. This proves the baud generator,
+shifter, both FIFOs and the LP clock — **not the pads and not a wire.** The RXD pad
+level is read back and printed separately so the pad state is asserted rather than
+inferred: a silently failed pad setup would leave the loopback passing while
+proving nothing, which is exactly the LP I2C failure shape.
 
 ## The pre-build guard check
 
