@@ -19,7 +19,9 @@ extern "C" {
  * is why the self test passed on IO13 - but a test pad that collides with a
  * hardware function is a trap for whoever next enables the USB serial/JTAG
  * console. `c5pins` reports the clash; this is the fix it asked for. */
-#define C5_PCNT_TEST_PIN    5
+/* MOVED OFF IO5 for the same reason as CAN: IO5 is the LP UART's TXD and that
+ * assignment cannot move. PCNT counts through the GPIO matrix, so it can. */
+#define C5_PCNT_TEST_PIN    27
 
 rt_err_t rt_hw_pcnt_init(void);
 rt_err_t rt_hw_pcnt_setup(int unit, rt_base_t pin);

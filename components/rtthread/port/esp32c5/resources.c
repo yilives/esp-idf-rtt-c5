@@ -62,18 +62,40 @@ static const c5_pin_use_t s_pins[] =
     { 11, "uart0 console TX",           "UART0 default" },
     { 12, "uart0 console RX",           "UART0 default" },
 
-    /* Self-test and device pins, one row per driver. */
+    /* Self-test and device pins, one row per driver.
+     *
+     * THIS TABLE WENT STALE AND CERTIFIED A CONFLICT.
+     *
+     * It listed IO2 as SPI MISO and IO3 as the PWM test - both had already moved
+     * to IO23 and IO24 - and it did not know the LP I2C or LP UART existed. So
+     * when those two drivers took IO2/IO3/IO4/IO5, `c5pins` kept reporting PASS
+     * while IO4 and IO5 were each claimed twice. The real symptom was measured
+     * only by running the commands:
+     *
+     *     c5can -> PASS, c5lpuart -> PASS, c5can -> FAIL
+     *
+     * Entries are now written with the pin NUMBER and the MACRO it came from, and
+     * the macro column is checked by hand against the headers whenever a driver
+     * is added. A pin table that is not maintained is worse than none. */
     {  0, "RMT test (tx pad)",          "C5_RMT_TEST_PIN" },
     {  1, "MCPWM output A",             "C5_MCPWM_TEST_PIN_A" },
-    {  2, "SPI MISO",                   "C5_SPI0_MISO_PIN" },
-    {  3, "LEDC PWM test",              "C5_PWM_TEST_PIN" },
-    {  4, "CAN TX and RX (one pad)",     "C5_TWAI_TX_PIN" },
+    { 23, "SPI MISO",                   "C5_SPI0_MISO_PIN" },
+    { 24, "LEDC PWM test",              "C5_PWM_TEST_PIN" },
+    { 26, "CAN TX and RX (one pad)",    "C5_TWAI_TX_PIN" },
     {  6, "SPI clock",                  "C5_SPI0_SCLK_PIN" },
     {  7, "SPI MOSI",                   "C5_SPI0_MOSI_PIN" },
     {  8, "I2C SCL",                    "C5_I2C0_SCL_PIN" },
     {  9, "I2C SDA",                    "C5_I2C0_SDA_PIN" },
     { 10, "SPI chip select",            "C5_SPI0_CS_PIN" },
-    {  5, "PCNT test",                  "C5_PCNT_TEST_PIN" },
+    { 27, "PCNT test",                  "C5_PCNT_TEST_PIN" },
+
+    /* The LP peripherals. Their pads are FIXED by the LP IO MUX - this part does
+     * not define SOC_LP_GPIO_MATRIX_SUPPORTED, so nothing can be routed
+     * elsewhere - which is why everything above that could move did. */
+    {  2, "LP I2C SDA (LP IOMUX fixed)", "C5_LP_I2C_SDA_PIN" },
+    {  3, "LP I2C SCL (LP IOMUX fixed)", "C5_LP_I2C_SCL_PIN" },
+    {  5, "LP UART TXD (LP IOMUX fixed)", "C5_LP_UART_TXD_PIN" },
+    {  4, "LP UART RXD (LP IOMUX fixed)", "C5_LP_UART_RXD_PIN" },
 
     /* Multi-purpose pads that a peripheral has a fixed function on. Listed so the
      * check below can flag a test that strays onto one. */

@@ -439,8 +439,9 @@ void rt_hw_twai_stop(void)
 }
 
 /* Queue one classic frame. Returns RT_EOK once the buffer is armed. */
-rt_err_t rt_hw_twai_send(rt_uint32_t id, const rt_uint8_t *data, rt_uint32_t len,
-                         rt_uint32_t timeout_ms)
+rt_err_t rt_hw_twai_send_ex(rt_uint32_t id, const rt_uint8_t *data,
+                            rt_uint32_t len, rt_uint32_t timeout_ms,
+                            rt_uint32_t *out_buf_idx)
 {
     twaifd_frame_buffer_t buf;
     twai_frame_header_t hdr;
@@ -450,6 +451,11 @@ rt_err_t rt_hw_twai_send(rt_uint32_t id, const rt_uint8_t *data, rt_uint32_t len
     if (s_twai == RT_NULL || data == RT_NULL || len > 8u)
     {
         return -RT_EINVAL;
+    }
+
+    if (out_buf_idx != RT_NULL)
+    {
+        *out_buf_idx = 0xFFFFFFFFu;
     }
 
     rt_memset(&hdr, 0, sizeof(hdr));
@@ -512,7 +518,110 @@ rt_err_t rt_hw_twai_send(rt_uint32_t id, const rt_uint8_t *data, rt_uint32_t len
 
     twaifd_ll_set_tx_buffer_cmd(s_twai, (rt_uint8_t)buf_idx, TWAIFD_LL_TX_CMD_READY);
 
+    if (out_buf_idx != RT_NULL)
+    {
+        *out_buf_idx = buf_idx;
+    }
+
     return RT_EOK;
+}
+
+/* The buffer index is not needed by every caller, so the plain form stays. */
+rt_err_t rt_hw_twai_send(rt_uint32_t id, const rt_uint8_t *data, rt_uint32_t len,
+                         rt_uint32_t timeout_ms)
+{
+    return rt_hw_twai_send_ex(id, data, len, timeout_ms, RT_NULL);
+}
+
+/* State codes for a TX buffer, from the 4-bit tx_status field.
+ *
+ * Empty is 8, not 0 - the S31 file records that `while (status != 0)` never
+ * terminates. TX_OK and Failed both refuse a new frame; only Empty accepts one. */
+#define C5_TWAI_TXB_TX_OK   4u
+#define C5_TWAI_TXB_FAILED  6u
+
+/* Reclaim finished TX buffers.
+ *
+ * WHY THIS EXISTS - a compound bug that made the CAN device class work exactly
+ * once per boot:
+ *
+ *   1. after a frame goes out, its buffer sits in TX_OK (4) and nothing returned
+ *      it to Empty (8);
+ *   2. the next send scanned for a free buffer, skipped buffer 0 because it was
+ *      TX_OK, and took buffer 1;
+ *   3. the ISR reported TX_DONE for box 0 unconditionally, so buffer 1's
+ *      completion was never delivered;
+ *   4. `rt_completion_wait()` timed out, `_can_int_tx()` took its error path and
+ *      returned 0 bytes;
+ *   5. `rt_device_write()` therefore returned 0, and the test - which runs once
+ *      per boot - never saw it.
+ *
+ * Measured on the second run in one boot:
+ *
+ *     c5twai: tx_status=0x00008884 buffer(s)=4: [0]=4 [1]=8 [2]=8 [3]=8
+ *
+ * State 4 on buffer 0, empty on the rest. `c5twai` passes at four rates because
+ * it calls rt_hw_twai_send() directly and never waits on the device class's
+ * completion, which is why only `c5can` exposed this. */
+rt_uint32_t rt_hw_twai_reclaim_tx_buffers(void)
+{
+    rt_uint32_t i;
+    rt_uint32_t done = 0;
+
+    if (s_twai == RT_NULL)
+    {
+        return 0;
+    }
+
+    for (i = 0; i < s_twai_buffer_count; i++)
+    {
+        rt_uint32_t st = twaifd_ll_get_tx_buffer_status(s_twai, (rt_uint8_t)i);
+
+        if (st == C5_TWAI_TXB_TX_OK || st == C5_TWAI_TXB_FAILED)
+        {
+            twaifd_ll_set_tx_buffer_cmd(s_twai, (rt_uint8_t)i,
+                                        TWAIFD_LL_TX_CMD_EMPTY);
+            done |= (1u << i);
+        }
+    }
+
+    return done;
+}
+
+rt_uint32_t rt_hw_twai_tx_buffer_count(void)
+{
+    return s_twai_buffer_count;
+}
+
+/* Dump every TX buffer's state code, for the second-run failure report.
+ *
+ * The state is a 4-bit code per buffer in one register. Printing all of them says
+ * whether the buffers came back to Empty (8) after the previous run or are stuck
+ * in TX_OK (4) / Failed (6), which are the states that refuse a new frame. */
+rt_uint32_t rt_hw_twai_tx_status_dump(void)
+{
+    rt_uint32_t i;
+    rt_uint32_t raw;
+
+    if (s_twai == RT_NULL)
+    {
+        rt_kprintf("c5twai: no controller\n");
+        return 0;
+    }
+
+    raw = s_twai->tx_status.val;
+
+    rt_kprintf("c5twai: tx_status=0x%08x buffer(s)=%u:", (unsigned)raw,
+               (unsigned)s_twai_buffer_count);
+
+    for (i = 0; i < s_twai_buffer_count; i++)
+    {
+        rt_kprintf(" [%u]=%u", (unsigned)i,
+                   (unsigned)twaifd_ll_get_tx_buffer_status(s_twai, (rt_uint8_t)i));
+    }
+
+    rt_kprintf("\n");
+    return raw;
 }
 
 /* Receive one frame, if one is waiting. */

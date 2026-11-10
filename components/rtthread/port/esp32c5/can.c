@@ -69,6 +69,27 @@
 /* One device; the second controller is not brought up (port_twai.h: C5_TWAI_ID). */
 static struct rt_can_device s_can0;
 static rt_bool_t           s_can0_ready;
+
+/* FRAMEWORK BOX -> HARDWARE BUFFER.
+ *
+ * Two index spaces that look alike and are not:
+ *
+ *   - `_can_int_tx()` (dev_can.c:186) numbers boxes from ITS OWN freelist and
+ *     addresses completions with `event >> 8` in that numbering;
+ *   - this controller has its own TX buffer indices, chosen by scanning
+ *     `tx_status` for an Empty buffer.
+ *
+ * `c5_can_sendmsg()` receives the former as `boxno` and used to discard it
+ * (`(void)boxno;`), so nothing recorded which hardware buffer a box's frame went
+ * into. The ISR then had to guess, and it guessed box 0 - which is right exactly
+ * until buffer 0 is left in TX_OK and the send path starts using buffer 1.
+ *
+ * Measured consequence: the second `c5can` in one boot returned 0 bytes from
+ * `rt_device_write`, because the completion it waited on was reported at a box
+ * that was not the one waiting.
+ *
+ * -1 means "no hardware buffer owned by this box". */
+static rt_int8_t           s_box_to_hw[8];
 static intr_handle_t       s_can0_intr;
 static int                 s_can0_intno = -1;
 
@@ -148,8 +169,30 @@ static rt_err_t c5_can_control(struct rt_can_device *can, int cmd, void *arg)
     case RT_CAN_CMD_SET_BAUD:
     {
         rt_uint32_t baud = (rt_uint32_t)(rt_ubase_t)arg;
+        rt_err_t err = rt_hw_twai_set_bitrate(baud);
 
-        return rt_hw_twai_set_bitrate(baud);
+        if (err == RT_EOK)
+        {
+            /* RE-ARM THE INTERRUPT HERE, not only in configure().
+             *
+             * `c5_can_configure()` runs from `rt_can_init()` on the FIRST open
+             * only - the framework initialises the device once - so a second open
+             * in the same boot never reaches `c5_can_irq_arm()`. Meanwhile this
+             * driver's own exit path disables the interrupt on purpose (see the
+             * note at the end of `c5_can_selftest`), so after one run the hardware
+             * mask was 0 and the second run's TX_DONE never arrived.
+             *
+             * Measured: `c5can` passed once and then failed every time, with
+             * `tx_status` showing the frame had gone out and completed
+             * (`[0]=4`) while the device class waited for a completion no ISR
+             * would deliver. The frame was never the problem; the interrupt was.
+             *
+             * Any command that reprograms the hardware re-arms, so the state does
+             * not depend on how many times the device was opened. */
+            c5_can_irq_arm();
+        }
+
+        return err;
     }
 
     case RT_CAN_CMD_SET_MODE:
@@ -227,10 +270,23 @@ static rt_ssize_t c5_can_sendmsg(struct rt_can_device *can, const void *buf,
         return -RT_EINVAL;
     }
 
-    err = rt_hw_twai_send(msg->id, msg->data, msg->len, 100u);
-    if (err != RT_EOK)
     {
-        return err;
+        rt_uint32_t hw_buf = 0xFFFFFFFFu;
+
+        err = rt_hw_twai_send_ex(msg->id, msg->data, msg->len, 100u, &hw_buf);
+
+        if (err != RT_EOK)
+        {
+            return err;
+        }
+
+        /* Remember which hardware buffer this box's frame occupies, so the ISR
+         * can report the completion at the box that is actually waiting. */
+        if (boxno < 8u && hw_buf != 0xFFFFFFFFu)
+        {
+            s_box_to_hw[boxno] = (rt_int8_t)hw_buf;
+        }
+
     }
 
     /* Return RT_EOK, not the length.
@@ -316,8 +372,45 @@ static void IRAM_ATTR c5_can_isr(int vector, void *param)
 
     if (status & TWAIFD_LL_INTR_TX_DONE)
     {
+        rt_uint32_t done;
+        rt_uint32_t i;
+
         twaifd_ll_clr_intr_status(&TWAI0, TWAIFD_LL_INTR_TX_DONE);
-        rt_hw_can_isr(&s_can0, RT_CAN_EVENT_TX_DONE | (0u << 8));
+
+        /* REPORT THE BUFFER THAT ACTUALLY FINISHED, and reclaim it.
+         *
+         * This used to be `RT_CAN_EVENT_TX_DONE | (0u << 8)` - box 0, always.
+         * The device class then completed box 0's transmit while the frame that
+         * finished was in whatever buffer the send path picked, which stops
+         * being buffer 0 as soon as buffer 0 is left in TX_OK. Measured
+         * consequence: the second `c5can` in a boot returned 0 bytes from
+         * `rt_device_write` because the completion it waited on never arrived.
+         *
+         * `rt_hw_twai_reclaim_tx_buffers()` returns a bitmask of the buffers
+         * that were in TX_OK/Failed, so each one is reported at its own box
+         * number - which is what `rt_hw_can_isr` uses to find the right
+         * `rt_completion`. */
+        done = rt_hw_twai_reclaim_tx_buffers();
+
+        /* Translate the completed HARDWARE buffers back to the FRAMEWORK boxes
+         * that own them. `rt_hw_can_isr()` is addressed in the framework's
+         * numbering - reporting the hardware index there made a completion land
+         * on a box that was not waiting, and the waiting one timed out. */
+        for (i = 0; i < 8u; i++)
+        {
+            rt_int8_t hw = s_box_to_hw[i];
+
+            if (hw < 0)
+            {
+                continue;
+            }
+
+            if (done & (1u << (rt_uint32_t)hw))
+            {
+                s_box_to_hw[i] = -1;
+                rt_hw_can_isr(&s_can0, RT_CAN_EVENT_TX_DONE | (i << 8));
+            }
+        }
     }
 
     if (status & TWAIFD_LL_INTR_RX_FULL)
@@ -437,6 +530,7 @@ rt_err_t rt_hw_can_c5_init(void)
      * consume the events the register test looks at. */
     c5_can_irq_arm();
 
+    rt_memset(s_box_to_hw, -1, sizeof(s_box_to_hw));
     s_can0_ready = RT_TRUE;
     return RT_EOK;
 }
@@ -524,11 +618,32 @@ int c5_can_selftest(void)
     tx.len = sizeof(payload);
     rt_memcpy(tx.data, payload, sizeof(payload));
 
-    if (rt_device_write(dev, 0, &tx, sizeof(tx)) != (rt_ssize_t)sizeof(tx))
     {
-        rt_kprintf("c5can   : FAIL, write through the device class\n");
-        rt_device_close(dev);
-        return -1;
+        rt_ssize_t w = rt_device_write(dev, 0, &tx, sizeof(tx));
+
+        if (w != (rt_ssize_t)sizeof(tx))
+        {
+            /* SAY WHICH FAILURE. The device class returns the number of bytes
+             * accepted, so a short write means the frame was rejected at the open
+             * call - a closed device, a wrong flag, or a controller still off the
+             * bus. Printing only "write failed" left the distinction between
+             * "never opened" and "controller refused the frame" unstated, and
+             * those need different fixes.
+             *
+             * Measured: this test passes on the first run in a boot and fails on
+             * every run after it, with no LP UART involved - `c5can c5can c5can`
+             * shows PASS then two failures. So the state that breaks it persists
+             * across the open/close cycle inside the CAN driver itself. */
+            rt_kprintf("c5can   : FAIL, write through the device class returned %d, "
+                       "expected %d (the frame was rejected, not truncated)\n",
+                       (int)w, (int)sizeof(tx));
+            {
+                extern rt_uint32_t rt_hw_twai_tx_status_dump(void);
+                (void)rt_hw_twai_tx_status_dump();
+            }
+            rt_device_close(dev);
+            return -1;
+        }
     }
 
     /* Read back without blocking: the loopback frame is already in the FIFO by
