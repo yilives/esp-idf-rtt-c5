@@ -592,7 +592,9 @@ elseif(CONFIG_IDF_TARGET_ESP32C5)
         # Kernel soak: does anything leak under sustained churn.
         "port/esp32c5/soak.c"
         # The LP I2C experiment through IDF's own driver. Temporary.
-        "port/esp32c5/lp_i2c_idf.c")
+        "port/esp32c5/lp_i2c_idf.c"
+        # The LP UART, written after the LP I2C pad lesson.
+        "port/esp32c5/lp_uart.c")
 
     # The FreeRTOS-API compatibility layer, target independent - the same files
     # the S31 uses. Without this block a C5 build with
@@ -830,6 +832,7 @@ if(CONFIG_IDF_TARGET_ESP32C5)
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_dma_psram_selftest")
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_soak_selftest")
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_lp_i2c_idf_selftest")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u c5_lp_uart_selftest")
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-u rt_hw_pin_init" "-u c5_probe_pads")
     # lp_sleep.c has no init function of its own - it is driven from the
     # shell and from the boot banner - so the anchor is its command.
