@@ -634,6 +634,7 @@ It took six layers to reach the bottom because each fix moved the crash:
 | 4 | `ft_ipc_push` | `ft_ipc (noflash)` |
 | 5 | `rt_memcpy` | `kstring (noflash)` |
 | 6 | `ft_qset_signal` | the remaining shim files |
+| 7 | `rt_sched_thread_ready` | `scheduler_comm (noflash)` |
 
 **That is why it looked intermittent: the crash site moved every time.** What
 identified it was a coordinate, not a hypothesis — `MEPC` in `0x420xxxxx` (flash)
@@ -645,9 +646,21 @@ same file did not**. A file whose entry points are ISR-callable must be placed a
 a unit.
 
 ```
-_iram_end      = 0x40820b00   (130.8 KB)
-__heap_start__ = 0x40834b70   (79.2 KB still free)
+_iram_end      = 0x40820c00   (131.0 KB)
+__heap_start__ = 0x40834c30   (79.5 KB still free)
 ```
+
+The deferred yield also stops `rt_schedule()` being called with the cache off; that
+was the change that ended the abort, and the seven relocations are what stopped the
+cache errors before it could get there.
+
+Verified in one session: `c5stat -> c5all 0 -> c5join5 x5 -> c5iperf x2 -> c5stat`
+gave `c5all PASS`, `GOT_IP x6`, zero cache errors, `tick 73 -> 109906` (110 s
+continuous, no reset).
+
+**Not proof of convergence.** 79.5 KB of IRAM remains, `scheduler_comm`'s own
+callees were not audited, and one sequence is one sample. An eighth layer is
+neither present nor excluded.
 
 Six consecutive joins, all `GOT_IP`.
 
