@@ -98,6 +98,20 @@ entries:
         # layer appears, the answer is the structural change (an ISR path
         # that does not call the kernel), not another line here.
         kstring (noflash)
+        # scheduler_comm: seventh layer. rt_sem_release, called from the shim
+        # ISR, dequeues a waiting thread and marks it ready:
+        #
+        #   RA   = 0x4081d1be  rt_susp_list_dequeue  (ipc.c:120, IRAM)
+        #   MEPC = 0x4200cb0c  rt_sched_thread_ready (scheduler_comm.c:233, flash)
+        #
+        # The deferred-yield fix removed the rt_schedule() call from the ISR,
+        # but release() reaches flash before it would ever get there. `ipc` is
+        # already in IRAM; this is the file it calls next.
+        #
+        # STOPPING CONDITION: if an EIGHTH layer appears, the conclusion is
+        # that the shim's ISR path cannot be made safe on this kernel by
+        # relocation, and the limit gets documented instead.
+        scheduler_comm (noflash)
         # ft_qset: sixth layer, reached from ft_ipc_send_isr (ft_qset.c:171).
         # Taken because it is small and already on the path; the note in
         # ft_ipc above still applies - if a SEVENTH layer appears, the answer
