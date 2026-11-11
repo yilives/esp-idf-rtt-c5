@@ -679,39 +679,51 @@ board did not reboot since setup, use `tcpecho_loop.py` with the reply
 `pong-from-pc`, and record the value in RTC-noinit memory at the assert site -
 that survives the panic, which `.bss` does not.
 
-## A known limit: repeated Wi-Fi re-join
+## Repeated Wi-Fi re-join: fixed
 
-Four `c5join5` in one boot aborts with
+Four `c5join5` in one boot used to abort with
 
 ```
 RT-Thread scheduler entry while flash cache is disabled
 ```
 
-`rt_schedule()` is reached while the Wi-Fi driver writes NVS with the flash cache
-off. Six attempts to fix it by moving code into IRAM each moved the crash to the
-next function (`ft_ipc_resolve`, `rt_sem_trytake`, `rt_object_get_type`,
-`ft_ipc_push`, `rt_memcpy`, `ft_qset_signal`) and never eliminated it. A seventh -
-`rt_interrupt_enter/leave` around the shim ISR - changed nothing, because
-`rt_schedule()` calls `rt_thread_self()` *before* it looks at any nest counter.
+raised by `PRV_REQUIRE_CACHE_FOR_SWITCH()` in `vPortYieldFromISR()`. Nine attempts;
+eight failed:
 
-The real constraint:
+| # | attempt | outcome |
+|---|---|---|
+| 1-6 | move shim and kernel objects into IRAM, one crash address at a time | each moved the crash to the next function |
+| 7 | `rt_interrupt_enter/leave` around the shim ISR | no effect — `MEPC` shifted by exactly the 24 bytes of the added call |
+| 8 | `CONFIG_BT_CTRL_RUN_IN_FLASH_ONLY` | no effect — the fault is the **Wi-Fi** ISR, not BLE |
+| 9 | **do not call `rt_schedule()` when the cache is off** | **fixed** |
+
+```c
+if (cache_hal_is_cache_enabled(CACHE_LL_LEVEL_EXT_MEM, CACHE_TYPE_ALL)) {
+    rt_schedule();
+}
+```
+
+The yield is an optimisation: the woken thread is already in the ready queue and
+RT-Thread's 1 kHz tick schedules it anyway. Skipping one call delays the switch by
+at most 1 ms; aborting takes the chip down.
+
+**Cost, stated plainly:** during a flash write, a thread woken from an ISR runs up
+to 1 ms later. Invisible to throughput tests; it would matter to
+microsecond-latency work.
+
+Verified with the boot counter rather than a grepped error string — read `tick` at
+both ends of one serial session, since a reboot resets it:
 
 ```
-IRAM in use      130.8 KB
-IRAM still free   79.2 KB
-rt-thread text   ~105 KB
+four joins x3      : abort 0, panic 0, GOT_IP x4, tick monotonic
+six and eight joins: abort 0, panic 0
+c5all              : PASS
+BLE GATT from host : connected, 6 notifications, PASS
+full self-test     : 19 checks pass
 ```
 
-The kernel cannot be moved in, and moving enough to make one call safe leaves the
-next one unsafe.
-
-**The correct fix is a redesign**: `ft_ipc_send_isr` must call no kernel API at
-all - spinlock, append, set `*woken`, return - with the wake performed where the
-cache is guaranteed on. That changes `ft_ipc.c`, `ft_qset.c` and `ft_event.c`
-together.
-
-What works: single `c5join5`, TCP round trips, 13-21 Mbit/s throughput, and ten
-joins one call each across fresh boots. What does not: four joins inside one boot.
+Attempts 1-8 all asked *how to make `rt_schedule()` safe with the cache off*. The
+workable question was *why call it then*.
 
 ## The pre-build guard check
 
