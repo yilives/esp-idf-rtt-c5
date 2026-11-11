@@ -679,6 +679,40 @@ board did not reboot since setup, use `tcpecho_loop.py` with the reply
 `pong-from-pc`, and record the value in RTC-noinit memory at the assert site -
 that survives the panic, which `.bss` does not.
 
+## A known limit: repeated Wi-Fi re-join
+
+Four `c5join5` in one boot aborts with
+
+```
+RT-Thread scheduler entry while flash cache is disabled
+```
+
+`rt_schedule()` is reached while the Wi-Fi driver writes NVS with the flash cache
+off. Six attempts to fix it by moving code into IRAM each moved the crash to the
+next function (`ft_ipc_resolve`, `rt_sem_trytake`, `rt_object_get_type`,
+`ft_ipc_push`, `rt_memcpy`, `ft_qset_signal`) and never eliminated it. A seventh -
+`rt_interrupt_enter/leave` around the shim ISR - changed nothing, because
+`rt_schedule()` calls `rt_thread_self()` *before* it looks at any nest counter.
+
+The real constraint:
+
+```
+IRAM in use      130.8 KB
+IRAM still free   79.2 KB
+rt-thread text   ~105 KB
+```
+
+The kernel cannot be moved in, and moving enough to make one call safe leaves the
+next one unsafe.
+
+**The correct fix is a redesign**: `ft_ipc_send_isr` must call no kernel API at
+all - spinlock, append, set `*woken`, return - with the wake performed where the
+cache is guaranteed on. That changes `ft_ipc.c`, `ft_qset.c` and `ft_event.c`
+together.
+
+What works: single `c5join5`, TCP round trips, 13-21 Mbit/s throughput, and ten
+joins one call each across fresh boots. What does not: four joins inside one boot.
+
 ## The pre-build guard check
 
 Nine separate times, an Xtensa debugging probe added to shared code broke the
