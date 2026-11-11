@@ -742,8 +742,29 @@ void vPortYieldFromISR( void )
      * yield, an ISR reschedule must not rotate the interrupted thread's time
      * slice. rt_schedule() records the switch for the outermost trap exit. */
     if (rt_thread_self() != RT_NULL) {
-        PRV_REQUIRE_CACHE_FOR_SWITCH();
-        rt_schedule();
+        /* DEFER, DO NOT ABORT, WHEN THE FLASH CACHE IS OFF.
+         *
+         * This yield is an OPTIMISATION, not a correctness requirement: by the
+         * time any ISR reaches here, the thread it wants to wake is already in
+         * the ready queue, and RT-Thread's 1 kHz tick calls rt_schedule() on its
+         * own. Skipping this one call therefore delays the switch by at most one
+         * tick (1 ms) and loses nothing.
+         *
+         * Aborting, by contrast, takes the whole chip down. It used to:
+         *
+         *   RT-Thread scheduler entry while flash cache is disabled
+         *
+         * during a Wi-Fi re-join, because the ESP32-C5 Wi-Fi driver registers its
+         * handler with the ROM's `intr_handler_set()` (esp32c5.rom.ld) rather
+         * than `esp_intr_alloc()` - so IDF has no way to mask it around a flash
+         * operation, and it fires while NVS is being written with the cache off.
+         *
+         * Eight attempts to make the callee IRAM-safe all failed; the callee is
+         * RT-Thread's scheduler, which does not fit in IRAM. Not calling it is
+         * the answer, and a 1 ms deferral is a price worth stating plainly. */
+        if (cache_hal_is_cache_enabled(CACHE_LL_LEVEL_EXT_MEM, CACHE_TYPE_ALL)) {
+            rt_schedule();
+        }
     }
 #else
     BaseType_t coreID = xPortGetCoreID();
