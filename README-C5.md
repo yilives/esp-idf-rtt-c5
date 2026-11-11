@@ -621,6 +621,30 @@ Use `tools/tcpecho_loop.py <port> pong-from-pc` - it accepts repeatedly, unlike
 the test is; and a reading taken after a reboot is not a reading of the same
 state.
 
+## One open issue
+
+**`Invalid mbox` (`tcpip_send_msg_wait_sem`, `tcpip.c`) has been seen twice after
+a TCP throughput test, inside `c5all`, and has not been root-caused.** It is
+recorded as OPEN here rather than fixed.
+
+Ruled out with evidence: `tcpip_init()` not running (it does; `mbox` reads
+non-NULL), `c5_ble_init()` touching lwIP (it does not), `sys_mbox_new()` failing
+(never observed), `nimble_port_init()` failing (returns 0), a stale host server
+and buffered output hiding lines.
+
+The same sequence also **succeeded** in a later full run:
+
+```
+c5join5    -> GOT_IP
+c5iperf 3s -> 21418 kbit/s
+c5all      -> step1/2/3 all 0, PASS, alive after 60 s
+```
+
+If you hit it, start from: capture **unfiltered** output to a file, confirm the
+board did not reboot since setup, use `tcpecho_loop.py` with the reply
+`pong-from-pc`, and record the value in RTC-noinit memory at the assert site -
+that survives the panic, which `.bss` does not.
+
 ## The pre-build guard check
 
 Nine separate times, an Xtensa debugging probe added to shared code broke the
