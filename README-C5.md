@@ -590,6 +590,37 @@ Register contents after a cache fault carry no meaning. **The bad handle was a
 symptom.** What settled it was cheap: `nm` showed one side of the call in IRAM and
 the other in flash.
 
+## Testing TCP: three ways to make it look broken
+
+`c5tcp` appeared to fail intermittently with `assert failed:
+tcpip_send_msg_wait_sem (Invalid mbox)`. That assertion is real but it is **not a
+port defect** - three mistakes in how the test was invoked produced it, and ten
+rounds were spent chasing it.
+
+| mistake | what it looks like |
+|---|---|
+| `c5tcp` run **without** `c5join5` in the same boot | the assert, then a reboot; the next run asserts again |
+| a server that accepts **one** connection (`tcpecho.py`) | `errno=104` on runs 2 and 3 |
+| a reply other than `"pong-from-pc"` | `received 4 byte(s): pong` then `FAIL, reply is not the expected one` |
+
+`tcpip_mbox` is created by `tcpip_init()` inside `esp_netif_init()`; a socket
+call before that is a NULL mailbox and asserts. So:
+
+```
+msh > c5join5                                  # required, same boot
+msh > c5tcp <host-ip> 3334                     # with tcpecho_loop.py running
+tcp     : connected to 10.0.0.159:3334
+tcp     : sent 12 byte(s)
+tcp     : received 12 byte(s): pong-from-pc
+```
+
+Use `tools/tcpecho_loop.py <port> pong-from-pc` - it accepts repeatedly, unlike
+`tcpecho.py`, and answers with the string `c5_tcp` checks for.
+
+**Lessons, both about measurement:** when a fault is intermittent, check whether
+the test is; and a reading taken after a reboot is not a reading of the same
+state.
+
 ## The pre-build guard check
 
 Nine separate times, an Xtensa debugging probe added to shared code broke the
