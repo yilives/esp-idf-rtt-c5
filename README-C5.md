@@ -621,11 +621,45 @@ Use `tools/tcpecho_loop.py <port> pong-from-pc` - it accepts repeatedly, unlike
 the test is; and a reading taken after a reboot is not a reading of the same
 state.
 
+## IRAM: the same fault six times
+
+`Invalid mbox` after repeated Wi-Fi joins was **IRAM code calling flash code**.
+It took six layers to reach the bottom because each fix moved the crash:
+
+| # | `MEPC` (flash) | fixed by |
+|---|---|---|
+| 1 | `ft_ipc_resolve` | `FT_IRAM` unconditional |
+| 2 | `rt_sem_trytake` | `ipc (noflash)` |
+| 3 | `rt_object_get_type` | `object (noflash)` |
+| 4 | `ft_ipc_push` | `ft_ipc (noflash)` |
+| 5 | `rt_memcpy` | `kstring (noflash)` |
+| 6 | `ft_qset_signal` | the remaining shim files |
+
+**That is why it looked intermittent: the crash site moved every time.** What
+identified it was a coordinate, not a hypothesis — `MEPC` in `0x420xxxxx` (flash)
+while `RA` was in `0x4080xxxx` (IRAM). One side of the same call in each region.
+It was visible in every panic dump that had already been captured.
+
+The entry points had `FT_IRAM` from the first fix; their **static helpers in the
+same file did not**. A file whose entry points are ISR-callable must be placed as
+a unit.
+
+```
+_iram_end      = 0x40820b00   (130.8 KB)
+__heap_start__ = 0x40834b70   (79.2 KB still free)
+```
+
+Six consecutive joins, all `GOT_IP`.
+
+**Not proof that a seventh layer does not exist.** The headroom is finite and the
+approach does not scale — the kernel is ~105 KB of text. The structural fix is an
+ISR path that does not call the kernel (FreeRTOS's `FromISR` contract is
+lightweight by design; this shim forwards to a locking kernel).
+
 ## One open issue
 
-**`Invalid mbox` (`tcpip_send_msg_wait_sem`, `tcpip.c`) has been seen twice after
-a TCP throughput test, inside `c5all`, and has not been root-caused.** It is
-recorded as OPEN here rather than fixed.
+~~`Invalid mbox`~~ **Resolved above** - it was IRAM/flash mixing, six layers deep.
+The section is kept for the diagnostic advice, which still applies.
 
 Ruled out with evidence: `tcpip_init()` not running (it does; `mbox` reads
 non-NULL), `c5_ble_init()` touching lwIP (it does not), `sys_mbox_new()` failing
