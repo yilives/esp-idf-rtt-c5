@@ -62,6 +62,50 @@ entries:
         # ------------------------------------------------------------
         ipc (noflash)
         object (noflash)
+        # The shim's own IPC layer, as a WHOLE OBJECT.
+        #
+        # `FT_IRAM` on the entry points is not enough and the reason is
+        # structural: those functions call static helpers in the same file
+        # (ft_ipc_push, ft_ipc_pop, ...) which carry no attribute and stayed
+        # in flash. Adding the attribute per function is what kept failing:
+        #
+        #   MEPC = 0x4206f21e  ft_ipc_resolve   (flash)  <- fixed by FT_IRAM
+        #   MEPC = 0x4206de8c  ft_ipc_push      (flash)  <- next one, same cause
+        #   RA   = 0x40809720  ft_ipc_send_isr  (IRAM)
+        #
+        # Each round fixed the address that had crashed and exposed the next
+        # one, which is why the symptom looked intermittent and the faulting
+        # function changed every time. The whole file belongs to the
+        # interrupt path, so the whole file goes to IRAM.
+        ft_ipc (noflash)
+        freertos_api (noflash)
+        # kstring: rt_memcpy and friends, reached from ft_ipc_push.
+        #
+        # Fifth layer of the same problem. The chain is
+        #
+        #   Wi-Fi ISR -> xQueueGenericSendFromISR (IRAM)
+        #     -> ft_ipc_send_isr -> ft_ipc_push (IRAM)
+        #       -> rt_memcpy (flash)   <- measured MEPC 0x420011ae
+        #
+        # This is the point where the approach stops scaling: the shim
+        # forwards to a kernel that is flash-resident by default, and IDF's
+        # Wi-Fi ISR is registered with ESP_INTR_FLAG_IRAM because real
+        # FreeRTOS keeps the equivalent queue code in IRAM. Pulling the
+        # kernel in object by object will consume IRAM the kernel does not
+        # fit in (~105 KB of text for ~80 KB of headroom).
+        #
+        # kstring is taken because it is small and on the path; if another
+        # layer appears, the answer is the structural change (an ISR path
+        # that does not call the kernel), not another line here.
+        kstring (noflash)
+        # ft_qset: sixth layer, reached from ft_ipc_send_isr (ft_qset.c:171).
+        # Taken because it is small and already on the path; the note in
+        # ft_ipc above still applies - if a SEVENTH layer appears, the answer
+        # is the structural change, not another line here.
+        ft_qset (noflash)
+        ft_event (noflash)
+        ft_notify (noflash)
+        ft_task (noflash)
         thread:rt_thread_resume (noflash)
         thread:rt_thread_suspend (noflash)
 
