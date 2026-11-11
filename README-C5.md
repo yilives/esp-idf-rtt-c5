@@ -681,15 +681,22 @@ that survives the panic, which `.bss` does not.
 
 ## Throughput, measured properly
 
-~**24.0 Mbit/s** sustained TCP send on 5 GHz, repeatable to +-2% across three runs
-in one boot:
+Sustained TCP send, three runs inside one boot each, `tcpsink_loop.py`:
 
-```
-23970 / 23736 / 24115 kbit/s
-```
+| band / condition | three runs (kbit/s) | median |
+|---|---|---|
+| 5 GHz, ch36/44 | 23970 / 23736 / 24115 | **~23.9 Mbit/s** |
+| 2.4 GHz, ch1 | 22748 / 23501 / 23572 | **~23.5 Mbit/s** |
+| 5 GHz + BLE connected, subscribed | 23569 / 23252 / 23583 | **~23.5 Mbit/s** |
 
-With a BLE client connected and subscribed to notifications: ~**23.5 Mbit/s**,
-about 2% lower - what a time-sliced coexistence arbiter should look like.
+A live BLE connection costs about **2%** - what a time-sliced coexistence arbiter
+should look like.
+
+**This is not an RF ceiling.** 2.4 GHz (40 MHz, 802.11n) and 5 GHz (80 MHz,
+802.11ac) have very different theoretical maxima yet both read ~23.5 Mbit/s, so
+the board is the bottleneck. The honest sentence is "about 23.5 Mbit/s in both
+bands", not "5 GHz is no faster than 2.4 GHz" - the data supports a claim about
+this end of the link, not about the radio.
 
 **Older figures in this README were wrong** (13-21 Mbit/s, and "BLE costs
 10-40%"). They came from `tools/tcpsink.py`, which accepts **one** connection and
