@@ -679,6 +679,28 @@ board did not reboot since setup, use `tcpecho_loop.py` with the reply
 `pong-from-pc`, and record the value in RTC-noinit memory at the assert site -
 that survives the panic, which `.bss` does not.
 
+## Throughput, measured properly
+
+~**24.0 Mbit/s** sustained TCP send on 5 GHz, repeatable to +-2% across three runs
+in one boot:
+
+```
+23970 / 23736 / 24115 kbit/s
+```
+
+With a BLE client connected and subscribed to notifications: ~**23.5 Mbit/s**,
+about 2% lower - what a time-sliced coexistence arbiter should look like.
+
+**Older figures in this README were wrong** (13-21 Mbit/s, and "BLE costs
+10-40%"). They came from `tools/tcpsink.py`, which accepts **one** connection and
+exits: the second run in a boot had nobody draining the socket, so the sender
+blocked on a receive window and reported 338 kbit/s with ~4000 "window stalls".
+That was nearly written up as unstable Wi-Fi.
+
+Use `tools/tcpsink_loop.py` for repeated throughput measurement, and
+`tools/tcpecho_loop.py` for repeated round trips. Both exist because the
+single-connection versions silently change behaviour on the second connection.
+
 ## Repeated Wi-Fi re-join: fixed
 
 Four `c5join5` in one boot used to abort with
